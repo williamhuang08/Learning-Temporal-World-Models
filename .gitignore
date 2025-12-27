@@ -9,4 +9,4 @@ wandb/
 plots/
 
 model/model.ipynb
-visualize_models.ipynb
+model/visualize_models.ipynb
