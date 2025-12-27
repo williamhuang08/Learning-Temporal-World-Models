@@ -1,3 +1,5 @@
+.DS_Store
+
 data/medium-play-v1/data/main_data.hdf5
 *.hdf5
 
@@ -6,4 +8,5 @@ __pychache__/
 wandb/
 plots/
 
+model/model.ipynb
 visualize_models.ipynb
