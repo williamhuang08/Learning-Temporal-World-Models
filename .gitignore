@@ -4,6 +4,7 @@ data/medium-play-v1/data/main_data.hdf5
 *.hdf5
 
 __pychache__/
+learning_temporal_world_models.egg-info/
 
 wandb/
 plots/
