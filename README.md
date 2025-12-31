@@ -1,4 +1,4 @@
-# Learning Temporally Abstract World Models without Online Experimentation (in progress)
+# Learning Temporally and State Abstracted World Models without Online Experimentation (in progress)
 
 In this project, I extend the Online Planning with Offline Skill Models (OPOSM) paper to explore the synergies gained with temporal and state abstraction. 
 
