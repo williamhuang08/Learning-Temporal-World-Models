@@ -1,26 +1,12 @@
 """
-compare_checkpoints_plots.py
-
-Makes EACH figure contain ONE SUBPLOT PER CHECKPOINT.
-
-It produces (for each sampled dataset state):
-  1) global_map_grid      : dataset map + rollouts, one tile per checkpoint
-  2) traj_grid            : detailed XY rollouts, one tile per checkpoint
+Produces
+  1) global_map_grid: dataset map + rollouts, one tile per checkpoint
+  2) traj_grid: detailed XY rollouts, one tile per checkpoint
   3) endpoints_vs_tawm_grid: endpoints + TAWM ellipses, one tile per checkpoint
-
-Optionally (posterior demo mode):
-  4) posterior_grid_train : overlay dataset subtrajectory + rollouts + TAWM per checkpoint
-  5) posterior_grid_test  : same for test
-
-Notes:
-- This script avoids redefining functions twice.
-- It caches loaded models per checkpoint for speed.
-- It keeps S_stats (mean/std) per checkpoint and uses it ONLY for TAWM (p_psi) like your earlier code.
+  4) posterior_grid_train: overlay dataset subtrajectory + rollouts + TAWM, one tile per checkpoint
+  5) posterior_grid_test: same for test
 """
 
-# -------------------------
-# Imports
-# -------------------------
 import os
 import re
 import time
@@ -39,23 +25,18 @@ from torch.utils.data import Dataset, DataLoader
 from torch.distributions import Normal, Independent, TransformedDistribution
 from torch.distributions.transforms import TanhTransform
 
-# Your modules
 from skill_model import SkillPolicy, SkillPosterior, SkillPrior, TAWM
 from utils import pack_state_from_obs, read_antmaze_obs
 
 
-# -------------------------
-# Device + constants
-# -------------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+# CONSTANTS
 state_dim = 29
 action_dim = 8
-
-# Subtrajectory length (for posterior demo + for rollout horizon default)
+# Subtrajectory length 
 T = 40
 
-# Checkpoints you want tiles for
 checkpoints = [
     "../checkpoints/antmaze_diverse_detached_250_1.pth",
     "../checkpoints/antmaze_diverse_detached_250_0.01.pth",
@@ -68,10 +49,8 @@ checkpoints = [
 ]
 
 
-# -------------------------
-# Output dirs + saving
-# -------------------------
-def _safe(s: str) -> str:
+# Output dirs
+def safe(s: str):
     return re.sub(r"[^a-zA-Z0-9._-]+", "_", str(s))
 
 DIRNAME = "beta_values_test"
@@ -83,7 +62,7 @@ def save_fig(fig, stem: str, meta: dict | None = None, out_dir=PLOT_DIR, close=T
     meta = meta or {}
     stamp = time.strftime("%Y%m%d-%H%M%S")
     parts = [stem, stamp] + [f"{k}-{meta[k]}" for k in sorted(meta.keys())]
-    fname = "__".join(_safe(p) for p in parts) + ".png"
+    fname = "__".join(safe(p) for p in parts) + ".png"
     path = os.path.join(out_dir, fname)
     fig.savefig(path, dpi=200, bbox_inches="tight")
     if close:
@@ -92,30 +71,22 @@ def save_fig(fig, stem: str, meta: dict | None = None, out_dir=PLOT_DIR, close=T
     return path
 
 
-# -------------------------
 # Dataset + env
-# -------------------------
 ant_maze_dataset = minari.load_dataset("D4RL/antmaze/medium-diverse-v1")
 
 def recover_ant_env():
     return ant_maze_dataset.recover_environment()
 
 
-# -------------------------
-# Helpers: torch + dists
-# -------------------------
 def to_torch(x):
     return torch.as_tensor(x, dtype=torch.float32, device=device)
 
 def policy_dist(mu, std):
-    # tanh-squashed normal action dist
     base = Independent(Normal(mu, std.clamp_min(0.05)), 1)
     return TransformedDistribution(base, [TanhTransform(cache_size=1)])
 
 
-# -------------------------
 # MuJoCo state reset helpers
-# -------------------------
 def get_sim_handles(env):
     """Unwrap to reach model/data."""
     t = env
@@ -148,12 +119,10 @@ def set_env_state(env, qpos, qvel):
     _, model, data = get_sim_handles(env)
     data.qpos[:] = qpos
     data.qvel[:] = qvel
-    mujoco.mj_forward(model, data)
+    mujoco.mj_forward(model, data) # sets state such that it is in valid config
 
 
-# -------------------------
 # Random state sampling from dataset
-# -------------------------
 def collect_all_states(minari_ds):
     """
     Collect every (episode_idx, t, s_obs, s_ag) pair from dataset.
@@ -181,12 +150,10 @@ def collect_all_xy(minari_ds):
     return np.concatenate(all_xy, axis=0)
 
 
-# -------------------------
 # Checkpoint cache (models + per-ckpt stats)
-# -------------------------
-MODEL_CACHE = {}  # ckpt_path -> dict(models..., stats...)
+MODEL_CACHE = {}  
 
-def parse_beta(ckpt_path: str) -> str:
+def parse_beta(ckpt_path: str):
     base = os.path.basename(ckpt_path)
     m = re.search(r"_([0-9.]+)\.pth$", base)
     return m.group(1) if m else base
@@ -223,21 +190,13 @@ def get_models_for_checkpoint(ckpt_path: str, strict=True):
     return MODEL_CACHE[ckpt_path]
 
 
-# -------------------------
 # TAWM helpers (per checkpoint stats)
-# -------------------------
 def standardize_state_np(s, mean, std):
     mean = np.asarray(mean, np.float32)
     std  = np.asarray(std,  np.float32)
     return (s - mean) / std
 
 def unstandardize_mu_std_np(mu_std, std_std, mean, std):
-    """
-    If y_std = (y - mean)/std, and model outputs (mu_std, std_std),
-    then:
-      mu = mu_std * std + mean
-      std = std_std * std
-    """
     mean = np.asarray(mean, np.float32)
     std  = np.asarray(std,  np.float32)
     mu = mu_std * std + mean
@@ -264,16 +223,16 @@ def tawm_xy_gaussian_for_ckpt(s0_env, z, models):
     mean = models["stats"]["mean"]
     std  = models["stats"]["std"]
 
-    # standardize s0 for p_psi (like your earlier sampling code)
+    # standardize s0 for p_psi 
     s0_std = standardize_state_np(s0_env, mean, std)
     s0_t = to_torch(s0_std).unsqueeze(0)
     z_t  = z.unsqueeze(0).to(device)
 
-    mu_T_std, std_T_std = p_psi(s0_t, z_t)            # in standardized space
+    mu_T_std, std_T_std = p_psi(s0_t, z_t) # in standardized space
     mu_T_std  = mu_T_std.squeeze(0).cpu().numpy()
     std_T_std = std_T_std.squeeze(0).cpu().numpy()
 
-    mu_T, std_T = unstandardize_mu_std_np(mu_T_std, std_T_std, mean, std)  # unstandardized
+    mu_T, std_T = unstandardize_mu_std_np(mu_T_std, std_T_std, mean, std) 
 
     mean_xy = mu_T[-2:]
     std_xy  = std_T[-2:]
@@ -281,9 +240,7 @@ def tawm_xy_gaussian_for_ckpt(s0_env, z, models):
     return mean_xy, cov_xy
 
 
-# -------------------------
-# Rollouts: ONE checkpoint + ALL checkpoints
-# -------------------------
+# Rollouts
 @torch.no_grad()
 def rollout_one_checkpoint(
     env,
@@ -371,14 +328,14 @@ def rollout_all_checkpoints(
     N_trajs=20,
     horizon=40,
     seed=0,
-    z_strategy="own_prior",  # "own_prior" or "shared_first"
+    z_strategy="own_prior", # "own_prior" or "shared_first"
 ):
     """
     Returns:
-      trajs_groups : list[ list[(Ti,2)] ]  one list-of-trajs per checkpoint
-      z_list       : list[z_used_per_checkpoint]
-      s0_env_list  : list[s0_env_per_checkpoint]
-      titles       : list[str]
+      trajs_groups : one list-of-trajs per checkpoint
+      z_list: list[z_used_per_checkpoint]
+      s0_env_list: list[s0_env_per_checkpoint]
+      titles: list[str]
     """
     trajs_groups, z_list, s0_env_list, titles = [], [], [], []
     z_shared = None
@@ -415,9 +372,7 @@ def rollout_all_checkpoints(
     return trajs_groups, z_list, s0_env_list, titles
 
 
-# -------------------------
 # Plotting: GRID versions (one tile per checkpoint)
-# -------------------------
 def plot_xy_trajectories_grid(
     trajs_xy_groups,
     titles,
@@ -591,9 +546,7 @@ def plot_endpoints_vs_tawm_grid(
     return fig
 
 
-# -------------------------
 # Posterior demo dataset (optional)
-# -------------------------
 def make_episode_splits(minari_dataset, train=0.8, val=0.0, test=0.2, seed=0):
     episodes = list(minari_dataset.iterate_episodes())
     n = len(episodes)
@@ -676,7 +629,6 @@ def plot_posterior_grid(
         - sample z from posterior (that checkpoint’s q_phi) on that subtraj
         - rollout pi_theta with fixed z
         - overlay dataset subtrajectory + TAWM ellipses
-      -> Save ONE FIGURE PER (k) containing one tile per checkpoint
     """
     rng = np.random.default_rng(seed)
 
@@ -775,14 +727,12 @@ def plot_posterior_grid(
         save_fig(fig, stem="posterior_grid", meta=meta, close=True)
 
 
-# -------------------------
 # Main
-# -------------------------
 def main():
     env = recover_ant_env()
     all_xy = collect_all_xy(ant_maze_dataset)
 
-    # ---- 1) PRIOR rollouts from random dataset states (one grid per state) ----
+    # 1) Prior rollouts from random dataset states 
     random_states = sample_random_states_from_dataset(
         ant_maze_dataset,
         num_states=50,
@@ -800,7 +750,7 @@ def main():
             N_trajs=20,
             horizon=40,
             seed=1000 + k,
-            z_strategy="shared_first",   # or "shared_first"
+            z_strategy="shared_first", 
         )
 
         s0_xy = s0_ag_ds[:2]
@@ -824,7 +774,7 @@ def main():
             save=True, stem="endpoints_vs_tawm_grid", meta=meta
         )
 
-    # ---- 2) OPTIONAL: POSTERIOR rollouts demo (uncomment if you want) ----
+    # 2) Posterior rollouts 
     train_ids, _, test_ids = make_episode_splits(ant_maze_dataset, train=0.8, val=0.0, test=0.2, seed=0)
     train_ds = SubtrajDataset(ant_maze_dataset, T=T, episode_ids=train_ids, stride=3)
     test_ds  = SubtrajDataset(ant_maze_dataset, T=T, episode_ids=test_ids,  stride=3)
