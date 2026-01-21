@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import Normal, Independent
 
 # Each layer contains 256 neurons
 NUM_NEURONS = 256
@@ -176,7 +177,44 @@ class SkillPrior(nn.Module):
 
 class MoGSkillPrior(nn.Module):
     """Multimodal (K modes) Gaussian Prior"""
-    def __init__(self, state_dim):
+    def __init__(self, state_dim, K=4, h_dim=NUM_NEURONS):
+        super().__init__()
+        self.state_dim = state_dim
+        self.layers = nn.Sequential(
+            nn.Linear(state_dim, h_dim),
+            nn.ReLU(),
+            nn.Linear(h_dim, h_dim),
+            nn.ReLU()
+        )
+        self.logits = nn.Linear(h_dim, K)
+        self.mean_head = nn.Sequential(
+            nn.Linear(h_dim, h_dim),
+            nn.ReLU(),
+            nn.Linear(h_dim, K * Z_DIM)
+        )
+        self.sig_head = nn.Sequential(
+            nn.Linear(h_dim, h_dim),
+            nn.ReLU(),
+            nn.Linear(h_dim, K * Z_DIM),
+            nn.Softplus()
+        )
+        self.K = K
+
+    def forward(self, s0):
+        h = self.layers(s0)
+        logits = self.logits(h)
+        mean = self.mean_head(h).view(-1, self.K, Z_DIM)
+        std  = self.sig_head(h).view(-1, self.K, Z_DIM)
+        return logits, pi, mean, std
+    
+    def log_prob(self, z, s0):
+        # p(z|s0)  = sum_over_k(ith weight given s0 * ith Gaussian) (1)
+        logits, mean, std = self.forward(s0) # [B, K] for logits
+        log_pi = torch.log_softmax(logits, dim=-1)
+        # Construct K-diagonal Gaussian dist for each batch element and then obtain log prob of sampled z
+        log_comp = Independent(Normal(mean, std), 1).log_prob(z[:, None, :]) # z[:, None, :] has shape [B, 1, D]
+        log_mix = torch.logsumexp(log_pi + log_comp, dim=-1) # log of weighted sum of weighted sum
+        return log_mix # gives mixture density for each batch element
 
 
 class MeanNetwork(nn.Module):
