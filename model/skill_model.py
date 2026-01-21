@@ -172,6 +172,11 @@ class SkillPrior(nn.Module):
         mean = self.mean_head(feats)
         std  = self.sig_head(feats)
         return mean, std
+    
+
+class MoGSkillPrior(nn.Module):
+    """Multimodal (K modes) Gaussian Prior"""
+    def __init__(self, state_dim):
 
 
 class MeanNetwork(nn.Module):
