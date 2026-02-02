@@ -65,7 +65,7 @@ init_state_dependent = True
 random_goal = False # determines if we select a goal at random from dataset (random_goal=True) or use pre-set one from environment
 
 # filename = 'antmaze_diverse_detached_250_1.pth'
-filename = 'antmaze_diverse_detached_250_1.pth'
+filename = 'one_optimizer/antmaze_diverse_detached_250_1.pth'
 PATH = '../checkpoints/' + filename
 
 skillpost = SkillPosterior(state_dim=state_dim, action_dim=a_dim).to(device)
@@ -439,29 +439,31 @@ def plot_plan_blobs_vs_exec(env, executed_xy, plan_means_xy, plan_stds_xy, goal_
     plt.close(fig)
     print(f"saved -> {outpath}")
 
-def plot_plan_blobs_vs_exec_with_bg(
-    executed_xy, plan_means_xy, plan_stds_xy, goal_xy,
-    bg_img, bg_extent, x_centers, y_centers, occ,
-    outpath="plan_blobs_vs_exec_bg.png",
+
+def plot_plan_blobs_vs_exec_with_bg(all_xy,
+    executed_xy, plan_means_xy, plan_stds_xy, goal_xy, outpath="plan_blobs_vs_exec_bg.png",
     n_std=2.0
 ):
     exec_xy = np.asarray(executed_xy, dtype=np.float32)
 
     fig, ax = plt.subplots(figsize=(6.8, 6.4))
 
-    ax.imshow(
-        bg_img.T,                 
-        extent=bg_extent,
-        origin="lower",
-        alpha=0.35,
-        aspect="equal",
-    )
+    # ax.imshow(
+    #     bg_img.T,                 
+    #     extent=bg_extent,
+    #     origin="lower",
+    #     alpha=0.35,
+    #     aspect="equal",
+    # )
 
-    occ_nonzero = occ[occ > 0]
-    if occ_nonzero.size > 0:
-        thr = np.percentile(occ_nonzero, 10)  # tune: 5–20 works well
-        X, Y = np.meshgrid(x_centers, y_centers, indexing="xy")
-        ax.contour(X, Y, occ.T, levels=[thr], linewidths=1.2)
+    # occ_nonzero = occ[occ > 0]
+    # if occ_nonzero.size > 0:
+    #     thr = np.percentile(occ_nonzero, 10)  # tune: 5–20 works well
+    #     X, Y = np.meshgrid(x_centers, y_centers, indexing="xy")
+    #     ax.contour(X, Y, occ.T, levels=[thr], linewidths=1.2)
+    ax.scatter(all_xy[:, 0], all_xy[:, 1],
+               s=2, alpha=0.15, color="lightgray",
+               label="dataset states", zorder=1)
 
     if len(exec_xy) > 0:
         ax.plot(exec_xy[:, 0], exec_xy[:, 1], linewidth=2.5, label="executed", zorder=3)
@@ -479,9 +481,6 @@ def plot_plan_blobs_vs_exec_with_bg(
     ax.grid(True, alpha=0.25)
     ax.legend(loc="best")
 
-    ax.set_xlim(bg_extent[0], bg_extent[1])
-    ax.set_ylim(bg_extent[2], bg_extent[3])
-
     plt.tight_layout()
     plt.savefig(outpath, dpi=200)
     plt.close(fig)
@@ -489,18 +488,25 @@ def plot_plan_blobs_vs_exec_with_bg(
 
 exec_xy, goal_xy, last_s0_vec, last_eps_mean, first_s0_vec, first_eps_mean = run_skills_iterative_replanning(env,skill_seq_len=skill_seq_len,H=H,execute_n_skills=1,max_replans=max_replans,use_epsilon=True,goal_thresh2=1.0,deterministic=True)
 
-bg_img, bg_extent, x_centers, y_centers, occ = build_antmaze_background(data, bins=320, stride=2)
+# bg_img, bg_extent, x_centers, y_centers, occ = build_antmaze_background(data, bins=320, stride=2)
 
 # if last_eps_mean is not None and last_s0_vec is not None:
 #     planned_means_xy, planned_stds_xy = taww_plan_xy(first_s0_vec, first_eps_mean)
 #     plot_plan_blobs_vs_exec(env, exec_xy, planned_means_xy, planned_stds_xy, goal_xy,
 #                             outpath="plan_blobs_vs_exec.png", n_std=2.0)
 if last_eps_mean is not None and last_s0_vec is not None:
+    ant_maze_dataset = minari.load_dataset('D4RL/antmaze/medium-diverse-v1')
+
     planned_means_xy, planned_stds_xy = taww_plan_xy(first_s0_vec, first_eps_mean)
+
+    all_xy = []
+    for ep in ant_maze_dataset.iterate_episodes():
+        xy = ep.observations["achieved_goal"][:, :2]  
+        all_xy.append(xy)
+
+    all_xy = np.concatenate(all_xy, axis=0)
     plot_plan_blobs_vs_exec_with_bg(
-        exec_xy, planned_means_xy, planned_stds_xy, goal_xy,
-        bg_img, bg_extent, x_centers, y_centers, occ,
-        outpath="plan_blobs_vs_exec_bg.png",
+        all_xy, exec_xy, planned_means_xy, planned_stds_xy, goal_xy ,outpath="plan_blobs_vs_exec_bg.png",
         n_std=2.0
     )
 
