@@ -1,15 +1,16 @@
 #!/bin/bash
 #SBATCH --job-name=tawm_sweep
 #SBATCH --array 0-15 # create an array of tasks to run the same script
-#SBATCH --gres=gpu:1
+#SBATCH --partition=gpu          
+#SBATCH --gpus=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+#SBATCH --mem=80G
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/%x-%j.out  
 
 module load miniconda
 module activate myenv
-export WANDB_API_KEY="8f9cce9a570c0c331d1a016d8bb9c0b3f2ee8c09"
+export WANDB_API_KEY="$(cat ../.wandb_key)"
 
 cd /home/wwh2/palmer_scratch/rl  
 
