@@ -1,7 +1,7 @@
 '''File where we will sample a set of waypoints, and plan a sequence of skills to have our pointmass travel through those waypoints'''
 
 import minari
-from model.skill_model import SkillPolicy, SkillPosterior, SkillPrior, TAWM
+from model.skill_model import SkillPolicy, SkillPosterior, SkillPrior, TAWM, MoGSkillPrior
 from model.utils import load_checkpoint, pack_state_from_obs, read_antmaze_obs
 from utils import obs_to_state_vec, xy_from_state
 import numpy as np
@@ -64,6 +64,7 @@ term_state_dependent_prior = False
 init_state_dependent = True
 random_goal = False # determines if we select a goal at random from dataset (random_goal=True) or use pre-set one from environment
 
+# filename = 'antmaze_diverse_detached_250_1.pth'
 filename = 'antmaze_diverse_detached_250_1.pth'
 PATH = '../checkpoints/' + filename
 
@@ -71,6 +72,7 @@ skillpost = SkillPosterior(state_dim=state_dim, action_dim=a_dim).to(device)
 llpolicy = SkillPolicy(state_dim=state_dim, action_dim=a_dim).to(device)
 tawm = TAWM(state_dim=state_dim).to(device)
 skillprior = SkillPrior(state_dim=state_dim).to(device)
+# skillprior = MoGSkillPrior(state_dim=state_dim).to(device)
 _ = load_checkpoint(PATH, skillpost, llpolicy, tawm, skillprior)
 
 env.reset() # reset the env config start/end states
@@ -82,6 +84,40 @@ s0_torch = torch.cat([torch.tensor(s0,dtype=torch.float32).to(device=device).res
 skill_seq = torch.zeros((1,skill_seq_len,z_dim),device=device) # [1, skill_seq_len, z_dim]
 print('skill_seq.shape: ', skill_seq.shape)
 skill_seq.requires_grad = True
+
+def build_antmaze_background(minari_dataset, bins=300, stride=1):
+    xs, ys = [], []
+
+    for ep in minari_dataset.iterate_episodes():
+        ag = ep.observations["achieved_goal"].astype(np.float32)
+        ag = ag[::stride]
+        xs.append(ag[:, 0])
+        ys.append(ag[:, 1])
+
+    x = np.concatenate(xs)
+    y = np.concatenate(ys)
+
+    occ, xedges, yedges = np.histogram2d(x, y, bins=bins)
+
+    bg_img = np.log1p(occ)  
+    extent = [xedges[0], xedges[-1], yedges[0], yedges[-1]]
+
+    x_centers = 0.5 * (xedges[:-1] + xedges[1:])
+    y_centers = 0.5 * (yedges[:-1] + yedges[1:])
+
+    return bg_img, extent, x_centers, y_centers, occ
+
+@torch.no_grad()
+def mog_mean_std(skillprior, s):
+
+    logits, mean, std = skillprior(s)          
+    k = logits.argmax(dim=-1)                  
+    # gather along the mixture dimension (-2)
+    idx = k.unsqueeze(-1).unsqueeze(-1).expand(*mean.shape[:-2], 1, mean.shape[-1]) 
+    mu_k  = mean.gather(dim=-2, index=idx).squeeze(-2)   
+    std_k = std.gather(dim=-2, index=idx).squeeze(-2)    
+    return mu_k, std_k
+
 
 @torch.no_grad()
 def policy_action(llpolicy, state_vec, z_vec, deterministic=True):
@@ -119,6 +155,15 @@ def convert_epsilon_to_z(epsilon, s0_vec):
         eps_i = epsilon[:, i, :] # [B,Z]
         z_i = mu_z + sigma_z * eps_i # [B,Z]
         z_seq.append(z_i.unsqueeze(1)) # [B,1,Z]
+
+        # logits, mu_z, sigma_z = skillprior(s) # [B,Z]
+        # k = torch.distributions.Categorical(logits=logits).sample().item()
+        # mu_k  = mu_z[0, k]                             
+        # std_k = sigma_z[0, k]    
+        # eps_i = epsilon[:, i, :] # [B,Z]
+        # z_i = mu_k + std_k * eps_i # [B,Z]
+        # z_seq.append(z_i.unsqueeze(1)) # [B,1,Z]
+        
         s_mean, _ = tawm(s, z_i)
         s = s_mean
     return torch.cat(z_seq, dim=1)
@@ -143,6 +188,7 @@ def get_expected_cost_variable_length(s0, skill_seq, lengths, goal_state, use_ep
 			if use_epsilons:
 				mu_z, sigma_z = skillprior(s_i)
 				z_i = mu_z + sigma_z*skill_seq[:,i:i+1,:]
+                
 			else:
 				z_i = skill_seq[:,i:i+1,:]
 			s_mean, s_sig = tawm(s_i,z_i)
@@ -205,8 +251,9 @@ def get_expected_cost_for_cem(s0, eps_seq, goal_xy, length_cost=0.0):
 
     for i in range(L):
         mu_z, sigma_z = skillprior(s)       
-        eps_i = eps_seq[:, i, :]             
-        z_i = mu_z + sigma_z * eps_i          
+        # mu_z, sigma_z = mog_mean_std(skillprior, s)
+        eps_i = eps_seq[:, i, :]
+        z_i = mu_z + sigma_z * eps_i           
 
         s, _ = tawm(s, z_i)                   
         costs.append(((s[:, -2:] - goal_xy) ** 2).mean(dim=-1) + (i+1)*length_cost)
@@ -291,6 +338,8 @@ def run_skill_seq(env, state_vec, eps_seq, use_epsilon=True, H=40,
         if use_epsilon:
             mu_z, sigma_z = skillprior(s_t)                         
             z = mu_z + sigma_z * eps_seq[i:i+1, :]  
+            # mu_z, sigma_z = mog_mean_std(skillprior, s_t)
+            # z = mu_z + sigma_z * eps_seq[i:i+1, :]
 
         # execute low-level steps for H 
         for t in range(H):
@@ -325,7 +374,9 @@ def taww_plan_xy(s0_vec_np, eps_plan, n_std=2.0):
     L = eps_plan.shape[0]
     for i in range(L):
         mu_z, sigma_z = skillprior(s)              
-        z = mu_z + sigma_z * eps_plan[i:i+1, :]   
+        z = mu_z + sigma_z * eps_plan[i:i+1, :] 
+        # mu_z, sigma_z = mog_mean_std(skillprior, s)
+        # z = mu_z + sigma_z * eps_plan[i:i+1, :]  
 
         s_mean, s_std = tawm(s, z)                
         s = s_mean                                 
@@ -388,10 +439,68 @@ def plot_plan_blobs_vs_exec(env, executed_xy, plan_means_xy, plan_stds_xy, goal_
     plt.close(fig)
     print(f"saved -> {outpath}")
 
+def plot_plan_blobs_vs_exec_with_bg(
+    executed_xy, plan_means_xy, plan_stds_xy, goal_xy,
+    bg_img, bg_extent, x_centers, y_centers, occ,
+    outpath="plan_blobs_vs_exec_bg.png",
+    n_std=2.0
+):
+    exec_xy = np.asarray(executed_xy, dtype=np.float32)
+
+    fig, ax = plt.subplots(figsize=(6.8, 6.4))
+
+    ax.imshow(
+        bg_img.T,                 
+        extent=bg_extent,
+        origin="lower",
+        alpha=0.35,
+        aspect="equal",
+    )
+
+    occ_nonzero = occ[occ > 0]
+    if occ_nonzero.size > 0:
+        thr = np.percentile(occ_nonzero, 10)  # tune: 5–20 works well
+        X, Y = np.meshgrid(x_centers, y_centers, indexing="xy")
+        ax.contour(X, Y, occ.T, levels=[thr], linewidths=1.2)
+
+    if len(exec_xy) > 0:
+        ax.plot(exec_xy[:, 0], exec_xy[:, 1], linewidth=2.5, label="executed", zorder=3)
+        ax.scatter(exec_xy[0, 0], exec_xy[0, 1], s=60, zorder=4)
+
+    ax.plot(plan_means_xy[:, 0], plan_means_xy[:, 1], linestyle="--",
+            linewidth=2.0, label="TAWM plan mean", zorder=2)
+
+    for i in range(1, len(plan_means_xy)):
+        add_green_blob(ax, plan_means_xy[i], plan_stds_xy[i], n_std=n_std, alpha=0.18)
+
+    ax.scatter(goal_xy[0], goal_xy[1], s=140, marker="*", color="black", label="goal", zorder=5)
+
+    ax.set_aspect("equal", "box")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best")
+
+    ax.set_xlim(bg_extent[0], bg_extent[1])
+    ax.set_ylim(bg_extent[2], bg_extent[3])
+
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=200)
+    plt.close(fig)
+    print(f"saved -> {outpath}")
+
 exec_xy, goal_xy, last_s0_vec, last_eps_mean, first_s0_vec, first_eps_mean = run_skills_iterative_replanning(env,skill_seq_len=skill_seq_len,H=H,execute_n_skills=1,max_replans=max_replans,use_epsilon=True,goal_thresh2=1.0,deterministic=True)
 
-# Optional: plot last plan vs executed
+bg_img, bg_extent, x_centers, y_centers, occ = build_antmaze_background(data, bins=320, stride=2)
+
+# if last_eps_mean is not None and last_s0_vec is not None:
+#     planned_means_xy, planned_stds_xy = taww_plan_xy(first_s0_vec, first_eps_mean)
+#     plot_plan_blobs_vs_exec(env, exec_xy, planned_means_xy, planned_stds_xy, goal_xy,
+#                             outpath="plan_blobs_vs_exec.png", n_std=2.0)
 if last_eps_mean is not None and last_s0_vec is not None:
     planned_means_xy, planned_stds_xy = taww_plan_xy(first_s0_vec, first_eps_mean)
-    plot_plan_blobs_vs_exec(env, exec_xy, planned_means_xy, planned_stds_xy, goal_xy,
-                            outpath="plan_blobs_vs_exec.png", n_std=2.0)
+    plot_plan_blobs_vs_exec_with_bg(
+        exec_xy, planned_means_xy, planned_stds_xy, goal_xy,
+        bg_img, bg_extent, x_centers, y_centers, occ,
+        outpath="plan_blobs_vs_exec_bg.png",
+        n_std=2.0
+    )
+

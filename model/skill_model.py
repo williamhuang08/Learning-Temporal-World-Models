@@ -79,6 +79,8 @@ class SkillPolicy(nn.Module):
         mean  = self.mean_head(feats)
         if self.max_sig is None:
             sig = F.softplus(self.sig_head(feats))
+            # sig = F.softplus(self.sig_head(feats)) + 1e-4
+            # sig = torch.clamp(sig, min=1e-4, max=10.0)
         else:
             sig = self.max_sig * torch.sigmoid(self.sig_head(feats))
         if self.fixed_sig is not None:
@@ -132,7 +134,8 @@ class TAWM(nn.Module):
         x = torch.cat([s0, z], dim=-1)
         feats = self.layers(x)
         mean  = self.mean_head(feats)
-        sig   = self.sig_head(feats)
+        sig   = self.sig_head(feats) 
+        # sig = torch.clamp(sig + 1e-4, min=1e-4, max=10.0)
         if not self.per_element_sigma:
             sig = sig.expand(-1, self.state_dim)
         return mean, sig
@@ -171,7 +174,8 @@ class SkillPrior(nn.Module):
     def forward(self, s0):
         feats = self.layers(s0)
         mean = self.mean_head(feats)
-        std  = self.sig_head(feats)
+        std = self.sig_head(feats)
+        # std = torch.clamp(std + 1e-4, min=1e-4, max=10.0)
         return mean, std
     
 
@@ -205,7 +209,8 @@ class MoGSkillPrior(nn.Module):
         logits = self.logits(h)
         mean = self.mean_head(h).view(-1, self.K, Z_DIM)
         std  = self.sig_head(h).view(-1, self.K, Z_DIM)
-        return logits, pi, mean, std
+        # std = torch.clamp(std + 1e-4, min=1e-4, max=10.0)
+        return logits, mean, std
     
     def log_prob(self, z, s0):
         # p(z|s0)  = sum_over_k(ith weight given s0 * ith Gaussian) (1)
@@ -262,6 +267,6 @@ class StandardDeviationNetwork(nn.Module):
         x = self.relu(self.fc1(x))
         x = self.fc2(x)
         std = self.softplus(x) 
-        #+ self.min_std  # lower bound
-        #std = torch.clamp(std, max=self.max_std)
+        # + self.min_std  # lower bound
+        # std = torch.clamp(std, max=self.max_std)
         return std
