@@ -11,3 +11,5 @@ plots/
 
 model/model.ipynb
 model/visualize_models.ipynb
+
+.wandb_key
