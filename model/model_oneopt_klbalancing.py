@@ -23,18 +23,18 @@ from skill_model import SkillPolicy, SkillPosterior, SkillPrior, TAWM
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--beta", type=float, required=True)
-parser.add_argument("--gamma", type=float, required=True)
-args = parser.parse_args()
+# parser = argparse.ArgumentParser()
+# parser.add_argument("--beta", type=float, required=True)
+# parser.add_argument("--gamma", type=float, required=True)
+# args = parser.parse_args()
 
-beta = args.beta
-gamma = args.gamma
+# beta = args.beta
+# gamma = args.gamma
 
 # beta = 1 
 # gamma = 0.01
-# betas = np.geomspace(0.001, 1, num=4) 
-# gammas = np.geomspace(0.001, 1, num=4)
+betas = np.geomspace(0.001, 1, num=4) 
+gammas = np.geomspace(0.001, 1, num=4)
 
 # According to the paper, each layer contains 256 neurons
 NUM_NEURONS = 256
@@ -333,7 +333,7 @@ def compute_loss_klbalancing(batch, beta, gamma):
     # w/ KL balancing
     log_prior_det = prior_dist.log_prob(z_detached).sum() / denom
     kl_prior = (log_post.detach() - log_prior_det) # prior to match post
-    kl_loss = gamma * kl_post + beta * kl_prior
+    kl_loss = beta * kl_post + gamma * kl_prior
 
     # TAWM over terminal state
     mu_T, std_T = p_psi(s0, z_detached)                            
@@ -497,31 +497,32 @@ def load_checkpoint(path, q_phi, pi_theta, p_psi, p_omega, strict=True):
 epochs = 50
 lr=5e-5
 
+for beta in betas:
+    for gamma in gammas:
+        # Initialize the models
+        q_phi = SkillPosterior(state_dim=state_dim, action_dim=action_dim).to(device)
+        pi_theta = SkillPolicy(state_dim=state_dim, action_dim=action_dim).to(device)
+        p_psi = TAWM(state_dim=state_dim).to(device)
+        p_omega = SkillPrior(state_dim=state_dim).to(device)
 
-# Initialize the models
-q_phi = SkillPosterior(state_dim=state_dim, action_dim=action_dim).to(device)
-pi_theta = SkillPolicy(state_dim=state_dim, action_dim=action_dim).to(device)
-p_psi = TAWM(state_dim=state_dim).to(device)
-p_omega = SkillPrior(state_dim=state_dim).to(device)
+        wandb.init(
+            project="tawm-skill-learning",
+            name=f"antmaze-medium-detached-klbalance-epoch{epochs}-beta{beta}-gamma{gamma}",
+            config=dict(
+                B=B, T=T, Z_DIM=Z_DIM, NUM_NEURONS=NUM_NEURONS,
+                e_lr=5e-5, m_lr=5e-5, e_steps=1, m_steps=1,
+                dataset="D4RL/antmaze/medium-diverse-v1",
+                device=device
+            )
+        )
 
-wandb.init(
-    project="tawm-skill-learning",
-    name=f"antmaze-medium-detached-klbalance-epoch{epochs}-beta{b}-gamma{g}",
-    config=dict(
-        B=B, T=T, Z_DIM=Z_DIM, NUM_NEURONS=NUM_NEURONS,
-        e_lr=5e-5, m_lr=5e-5, e_steps=1, m_steps=1,
-        dataset="D4RL/antmaze/medium-diverse-v1",
-        device=device
-    )
-)
+        wandb.watch([q_phi, pi_theta, p_psi, p_omega], log="gradients", log_freq=200)
 
-wandb.watch([q_phi, pi_theta, p_psi, p_omega], log="gradients", log_freq=200)
+        curves = skill_model_training_with_val(train_loader, test_loader, q_phi, pi_theta, p_psi, p_omega, beta, gamma, epochs=epochs, lr=lr, steps=1)
 
-curves = skill_model_training_with_val(train_loader, test_loader, q_phi, pi_theta, p_psi, p_omega, beta, gamma, epochs=epochs, lr=lr, steps=1)
+        wandb.finish()
 
-wandb.finish()
-
-save_checkpoint(f"checkpoints/antmaze_diverse_detached_klbalance_50_beta{b}_gamma{g}.pth", q_phi, pi_theta, p_psi, p_omega)
+        save_checkpoint(f"checkpoints/antmaze_diverse_detached_klbalance_50_beta{b}_gamma{g}.pth", q_phi, pi_theta, p_psi, p_omega)
 
 
 
