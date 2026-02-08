@@ -1,12 +1,3 @@
-"""
-Produces
-  1) global_map_grid: dataset map + rollouts, one tile per checkpoint
-  2) traj_grid: detailed XY rollouts, one tile per checkpoint
-  3) endpoints_vs_tawm_grid: endpoints + TAWM ellipses, one tile per checkpoint
-  4) posterior_grid_train: overlay dataset subtrajectory + rollouts + TAWM, one tile per checkpoint
-  5) posterior_grid_test: same for test
-"""
-
 import os
 import re
 import time
@@ -25,7 +16,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.distributions import Normal, Independent, TransformedDistribution
 from torch.distributions.transforms import TanhTransform
 
-from skill_model import SkillPolicy, SkillPosterior, SkillPrior, TAWM
+from skill_model import SkillPolicy, SkillPosterior, SkillPrior, TAWM, MoGSkillPrior
 from utils import pack_state_from_obs, read_antmaze_obs
 
 
@@ -37,23 +28,46 @@ action_dim = 8
 # Subtrajectory length 
 T = 40
 
-checkpoints = [
-    "../checkpoints/antmaze_diverse_detached_250_1.pth",
-    "../checkpoints/antmaze_diverse_detached_250_0.01.pth",
-    "../checkpoints/antmaze_diverse_detached_250_0.001.pth",
-    "../checkpoints/antmaze_diverse_detached_250_0.0001.pth",
-    "../checkpoints/antmaze_diverse_detached_250_10.pth",
-    "../checkpoints/antmaze_diverse_detached_250_100.pth",
-    "../checkpoints/antmaze_diverse_detached_250_1000.pth",
-    "../checkpoints/antmaze_diverse_detached_250_10000.pth",
+checkpoints1 = [
+    "../checkpoints/antmaze_diverse_detached_klbalance_50_0.1_0.2.pth"
+    # "../checkpoints/antmaze_diverse_detached_250_0.0001.pth",
+    # "../checkpoints/antmaze_diverse_detached_250_0.001.pth",
+    # "../checkpoints/antmaze_diverse_detached_250_0.01.pth",
+    # "../checkpoints/antmaze_diverse_detached_250_0.1.pth",
+    # "../checkpoints/antmaze_diverse_detached_250_1.pth",
+    # "../checkpoints/antmaze_diverse_detached_250_10.pth",
+    # "../checkpoints/antmaze_diverse_detached_250_100.pth",
+    # "../checkpoints/antmaze_diverse_detached_250_1000.pth",
+    # "../checkpoints/antmaze_diverse_detached_250_10000.pth",
+    # "../checkpoints/antmaze_diverse_detached_klbalance_250_0.0001_0.2.pth",
+    # "../checkpoints/antmaze_diverse_detached_klbalance_250_0.001_0.2.pth",
+    # "../checkpoints/antmaze_diverse_detached_klbalance_250_0.01_0.2.pth",
+    # "../checkpoints/antmaze_diverse_detached_klbalance_250_0.1_0.2.pth",
+    # # "../checkpoints/antmaze_diverse_detached_klbalance_250_1.pth",
+    # # "../checkpoints/antmaze_diverse_detached_klbalance_250_10.pth",
+    # "../checkpoints/antmaze_diverse_detached_klbalance_250_100_0.2.pth",
+    # # "../checkpoints/antmaze_diverse_detached_klbalance_250_1000.pth",
+    # "../checkpoints/antmaze_diverse_detached_klbalance_250_10000_0.2.pth",
 ]
 
+# checkpoints2 = [
+#     "../checkpoints/antmaze_diverse_detached_klbalance_250_0.2_0.0001.pth",
+#     "../checkpoints/antmaze_diverse_detached_klbalance_250_0.2_0.001.pth",
+#     "../checkpoints/antmaze_diverse_detached_klbalance_250_0.2_0.01.pth",
+#     "../checkpoints/antmaze_diverse_detached_klbalance_250_0.2_0.1.pth",
+#     # "../checkpoints/antmaze_diverse_detached_klbalance_250_1.pth",
+#     "../checkpoints/antmaze_diverse_detached_klbalance_250_0.2_10.pth",
+#     "../checkpoints/antmaze_diverse_detached_klbalance_250_0.2_100.pth",
+#     "../checkpoints/antmaze_diverse_detached_klbalance_250_0.2_1000.pth",
+#     "../checkpoints/antmaze_diverse_detached_klbalance_250_0.2_10000.pth",
+# ]
 
-# Output dirs
+
+
 def safe(s: str):
     return re.sub(r"[^a-zA-Z0-9._-]+", "_", str(s))
 
-DIRNAME = "beta_values_test"
+DIRNAME = "beta_values_test_0.2vsdetach"
 PLOT_DIR = os.path.join("plots", DIRNAME)
 os.makedirs(PLOT_DIR, exist_ok=True)
 
@@ -103,7 +117,7 @@ def split_obs_to_qpos_qvel(s0_obs, s0_ag, env):
     nq, nv = int(model.nq), int(model.nv)
 
     s0_obs = np.asarray(s0_obs, np.float32).ravel()
-    s0_ag  = np.asarray(s0_ag,  np.float32).ravel()
+    s0_ag = np.asarray(s0_ag,  np.float32).ravel()
 
     qpos = data.qpos.ravel().copy()
     qvel = data.qvel.ravel().copy()
@@ -150,7 +164,7 @@ def collect_all_xy(minari_ds):
     return np.concatenate(all_xy, axis=0)
 
 
-# Checkpoint cache (models + per-ckpt stats)
+# Checkpoint cache 
 MODEL_CACHE = {}  
 
 def parse_beta(ckpt_path: str):
@@ -165,7 +179,12 @@ def get_models_for_checkpoint(ckpt_path: str, strict=True):
     q_phi    = SkillPosterior(state_dim=state_dim, action_dim=action_dim).to(device)
     pi_theta = SkillPolicy(state_dim=state_dim, action_dim=action_dim).to(device)
     p_psi    = TAWM(state_dim=state_dim).to(device)
-    p_omega  = SkillPrior(state_dim=state_dim).to(device)
+    
+    # Use SkillPrior for checkpoints without klbalance, MoGSkillPrior for klbalance ones
+    if "klbalance" in ckpt_path:
+        p_omega = MoGSkillPrior(state_dim=state_dim).to(device)
+    else:
+        p_omega = SkillPrior(state_dim=state_dim).to(device)
 
     ckpt = torch.load(ckpt_path, weights_only=False, map_location=torch.device("cpu"))
     q_phi.load_state_dict(ckpt["q_phi"], strict=strict)
@@ -198,7 +217,7 @@ def standardize_state_np(s, mean, std):
 
 def unstandardize_mu_std_np(mu_std, std_std, mean, std):
     mean = np.asarray(mean, np.float32)
-    std  = np.asarray(std,  np.float32)
+    std = np.asarray(std,  np.float32)
     mu = mu_std * std + mean
     sd = std_std * std
     return mu, sd
@@ -280,8 +299,19 @@ def rollout_one_checkpoint(
     if z_fixed is not None:
         z0 = z_fixed.to(device).detach().clone().squeeze(0)
     elif use_prior:
-        mu_pr, std_pr = p_omega(s0_t)
-        z0 = (mu_pr + std_pr * torch.randn_like(mu_pr)).squeeze(0)
+        # Sample from prior - handle both SkillPrior and MoGSkillPrior
+        prior_output = p_omega(s0_t)
+        if isinstance(prior_output, tuple) and len(prior_output) == 3:
+            # MoGSkillPrior returns (logits, mu_pr, std_pr)
+            logits, mu_pr, std_pr = prior_output
+            k = torch.distributions.Categorical(logits=logits).sample().item()
+            mu_k  = mu_pr[0, k]                             
+            std_k = std_pr[0, k]                            
+            z0 = mu_k + std_k * torch.randn_like(mu_k)   
+        else:
+            # SkillPrior returns (mu_pr, std_pr)
+            mu_pr, std_pr = prior_output
+            z0 = (mu_pr + std_pr * torch.randn_like(mu_pr)).squeeze(0)
     else:
         raise ValueError("Need z_fixed if use_prior=False")
 
@@ -296,8 +326,19 @@ def rollout_one_checkpoint(
         if resample_skill_per_traj and (z_fixed is None) and use_prior:
             _, _, s0_env_local = pack_state_from_obs(cur_obs)
             s0_t_local = to_torch(s0_env_local).unsqueeze(0)
-            mu_pr, std_pr = p_omega(s0_t_local)
-            z = (mu_pr + std_pr * torch.randn_like(mu_pr)).squeeze(0)
+            # Sample from prior - handle both SkillPrior and MoGSkillPrior
+            prior_output = p_omega(s0_t_local)
+            if isinstance(prior_output, tuple) and len(prior_output) == 3:
+                # MoGSkillPrior returns (logits, mu_pr, std_pr)
+                logits, mu_pr, std_pr = prior_output
+                k = torch.distributions.Categorical(logits=logits).sample().item()
+                mu_k  = mu_pr[0, k]                             
+                std_k = std_pr[0, k]                            
+                z = mu_k + std_k * torch.randn_like(mu_k)   
+            else:
+                # SkillPrior returns (mu_pr, std_pr)
+                mu_pr, std_pr = prior_output
+                z = (mu_pr + std_pr * torch.randn_like(mu_pr)).squeeze(0)
         else:
             z = z0
 
@@ -330,13 +371,6 @@ def rollout_all_checkpoints(
     seed=0,
     z_strategy="own_prior", # "own_prior" or "shared_first"
 ):
-    """
-    Returns:
-      trajs_groups : one list-of-trajs per checkpoint
-      z_list: list[z_used_per_checkpoint]
-      s0_env_list: list[s0_env_per_checkpoint]
-      titles: list[str]
-    """
     trajs_groups, z_list, s0_env_list, titles = [], [], [], []
     z_shared = None
 
@@ -372,7 +406,6 @@ def rollout_all_checkpoints(
     return trajs_groups, z_list, s0_env_list, titles
 
 
-# Plotting: GRID versions (one tile per checkpoint)
 def plot_xy_trajectories_grid(
     trajs_xy_groups,
     titles,
@@ -546,7 +579,7 @@ def plot_endpoints_vs_tawm_grid(
     return fig
 
 
-# Posterior demo dataset (optional)
+# Posterior demo dataset 
 def make_episode_splits(minari_dataset, train=0.8, val=0.0, test=0.2, seed=0):
     episodes = list(minari_dataset.iterate_episodes())
     n = len(episodes)
@@ -554,10 +587,10 @@ def make_episode_splits(minari_dataset, train=0.8, val=0.0, test=0.2, seed=0):
     rng = np.random.RandomState(seed)
     rng.shuffle(idxs)
     n_train = int(round(train * n))
-    n_val   = int(round(val   * n))
+    n_val = int(round(val   * n))
     train_ids = idxs[:n_train]
-    val_ids   = idxs[n_train:n_train+n_val]
-    test_ids  = idxs[n_train+n_val:]
+    val_ids = idxs[n_train:n_train+n_val]
+    test_ids = idxs[n_train+n_val:]
     return train_ids, val_ids, test_ids
 
 class SubtrajDataset(Dataset):
@@ -732,6 +765,8 @@ def main():
     env = recover_ant_env()
     all_xy = collect_all_xy(ant_maze_dataset)
 
+    # Separate checkpoints into two groups
+
     # 1) Prior rollouts from random dataset states 
     random_states = sample_random_states_from_dataset(
         ant_maze_dataset,
@@ -746,7 +781,7 @@ def main():
             env,
             s0_obs_ds,
             s0_ag_ds,
-            checkpoints,
+            checkpoints1,
             N_trajs=20,
             horizon=40,
             seed=1000 + k,
@@ -759,20 +794,21 @@ def main():
         plot_global_map_grid(
             all_xy, trajs_groups, titles, s0_xy,
             ncols=4, share_limits=True,
-            save=True, stem="global_map_grid", meta=meta
+            save=True, stem="global_map_grid1", meta=meta
         )
 
         plot_xy_trajectories_grid(
             trajs_groups, titles,
             ncols=4, share_limits=True,
-            save=True, stem="traj_grid", meta=meta
+            save=True, stem="traj_grid1", meta=meta
         )
 
         plot_endpoints_vs_tawm_grid(
-            trajs_groups, s0_env_list, z_list, titles, checkpoints,
+            trajs_groups, s0_env_list, z_list, titles, checkpoints1,
             s0_xy=s0_xy, ncols=4,
-            save=True, stem="endpoints_vs_tawm_grid", meta=meta
+            save=True, stem="endpoints_vs_tawm_grid1", meta=meta
         )
+
 
     # 2) Posterior rollouts 
     train_ids, _, test_ids = make_episode_splits(ant_maze_dataset, train=0.8, val=0.0, test=0.2, seed=0)
@@ -780,9 +816,8 @@ def main():
     test_ds  = SubtrajDataset(ant_maze_dataset, T=T, episode_ids=test_ids,  stride=3)
     print(f"\nposterior datasets: train={len(train_ds)}  test={len(test_ds)}")
 
-    plot_posterior_grid(env, train_ds, checkpoints, K=10, tag="train", N_rollouts=25, horizon=T, ncols=4, seed=123)
-    plot_posterior_grid(env, test_ds,  checkpoints, K=10, tag="test",  N_rollouts=25, horizon=T, ncols=4, seed=999)
-
+    plot_posterior_grid(env, train_ds, checkpoints1, K=10, tag="train1", N_rollouts=25, horizon=T, ncols=4, seed=123)
+    plot_posterior_grid(env, test_ds,  checkpoints1, K=10, tag="test1",  N_rollouts=25, horizon=T, ncols=4, seed=999)
 
 if __name__ == "__main__":
     main()
