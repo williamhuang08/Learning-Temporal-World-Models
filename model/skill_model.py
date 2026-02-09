@@ -181,7 +181,7 @@ class SkillPrior(nn.Module):
 
 class MoGSkillPrior(nn.Module):
     """Multimodal (K modes) Gaussian Prior"""
-    def __init__(self, state_dim, K=4, h_dim=NUM_NEURONS):
+    def __init__(self, state_dim, K=10, h_dim=NUM_NEURONS):
         super().__init__()
         self.state_dim = state_dim
         self.layers = nn.Sequential(
@@ -213,12 +213,13 @@ class MoGSkillPrior(nn.Module):
         return logits, mean, std
     
     def log_prob(self, z, s0):
-        # p(z|s0)  = sum_over_k(ith weight given s0 * ith Gaussian) (1)
+        # p(z|s0)  = sum_over_k(ith weight given s0 * ith Gaussian) 
         logits, mean, std = self.forward(s0) # [B, K] for logits
         log_pi = torch.log_softmax(logits, dim=-1)
         # Construct K-diagonal Gaussian dist for each batch element and then obtain log prob of sampled z
+        # Independent(Normal(mean, std), 1) here simply means for each batch element and for each of the K modes for each element, sample a d-dimensional vector
         log_comp = Independent(Normal(mean, std), 1).log_prob(z[:, None, :]) # z[:, None, :] has shape [B, 1, D]
-        log_mix = torch.logsumexp(log_pi + log_comp, dim=-1) # log of weighted sum of weighted sum
+        log_mix = torch.logsumexp(log_pi + log_comp, dim=-1) # log of sum(pi * p(z|k)) = log of sum(exp(logpi + logp(z|k))) (summed across all K modes)
         return log_mix # gives mixture density for each batch element
 
 
