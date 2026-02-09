@@ -19,7 +19,7 @@ import wandb
 import os
 import argparse
 
-from skill_model import SkillPolicy, SkillPosterior, SkillPrior, TAWM
+from skill_model import SkillPolicy, SkillPosterior, SkillPrior, TAWM, MoGSkillPrior
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -475,7 +475,8 @@ for beta in betas:
         q_phi = SkillPosterior(state_dim=state_dim, action_dim=action_dim).to(device)
         pi_theta = SkillPolicy(state_dim=state_dim, action_dim=action_dim).to(device)
         p_psi = TAWM(state_dim=state_dim).to(device)
-        p_omega = SkillPrior(state_dim=state_dim).to(device)
+        p_omega = MoGSkillPrior(state_dim=state_dim).to(device)
+        # p_omega = SkillPrior(state_dim=state_dim).to(device)
 
         wandb.init(
             project="tawm-skill-learning",
