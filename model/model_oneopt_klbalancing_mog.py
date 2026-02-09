@@ -479,7 +479,7 @@ for beta in betas:
 
         wandb.init(
             project="tawm-skill-learning",
-            name=f"antmaze-medium-detached-klbalance-epoch{epochs}-beta{beta}-gamma{gamma}",
+            name=f"antmaze-medium-detached-klbalance-mog-epoch{epochs}-beta{beta}-gamma{gamma}",
             config=dict(
                 B=B, T=T, Z_DIM=Z_DIM, NUM_NEURONS=NUM_NEURONS,
                 e_lr=5e-5, m_lr=5e-5, e_steps=1, m_steps=1,
@@ -494,7 +494,7 @@ for beta in betas:
 
         wandb.finish()
 
-        save_checkpoint(f"checkpoints/antmaze_diverse_detached_klbalance_50_beta{b}_gamma{g}.pth", q_phi, pi_theta, p_psi, p_omega)
+        save_checkpoint(f"checkpoints/antmaze_diverse_detached_klbalance_mog_50_beta{beta}_gamma{gamma}.pth", q_phi, pi_theta, p_psi, p_omega)
 
 
 
