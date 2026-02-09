@@ -333,7 +333,7 @@ def eval_epoch(val_loader, q_phi, pi_theta, p_psi, p_omega, beta, gamma, device)
     loss_sum,policy_loss_sum, kl_loss_sum, state_decoder_loss_sum, n = 0.0, 0.0, 0.0, 0.0, 0
     for batch in val_loader:
         batch = {k: v.to(device) for k, v in batch.items()}
-        terms = compute_loss_klbalancing(batch, beta, gamma)
+        terms = compute_loss_klbalancing_mog(batch, beta, gamma)
         loss = terms["loss"]
         policy_loss = terms["policy_loss"]
         kl_loss = terms["kl_loss"]
@@ -379,7 +379,7 @@ def skill_model_training_with_val(
 
             for _ in range(steps):
                 opt.zero_grad(set_to_none=True)
-                terms = compute_loss_klbalancing(batch, beta, gamma)
+                terms = compute_loss_klbalancing_mog(batch, beta, gamma)
                 loss = terms["loss"]
                 policy_loss = terms["policy_loss"]
                 kl_loss = terms["kl_loss"]
