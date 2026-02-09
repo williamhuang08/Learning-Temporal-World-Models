@@ -153,85 +153,6 @@ for ep in ant_maze_dataset.iterate_episodes():
     all_xy.append(xy)
 
 all_xy = np.concatenate(all_xy, axis=0)
-def plot_subtraj_bg(ax, all_xy, subtraj_xy):
-    ax.clear()
-
-    ax.scatter(all_xy[:, 0], all_xy[:, 1],
-               s=2, alpha=0.15, color="lightgray",
-               label="dataset states", zorder=1)
-
-    if subtraj_xy is not None and len(subtraj_xy) > 0:
-        ax.plot(subtraj_xy[:, 0], subtraj_xy[:, 1],
-                linewidth=2.5, label="subtraj", zorder=3)
-        ax.scatter([subtraj_xy[0, 0]], [subtraj_xy[0, 1]],
-                   s=60, zorder=4, label="start")
-
-    ax.set_aspect("equal", "box")
-    ax.grid(True, alpha=0.25)
-    ax.legend(loc="best")
-    ax.set_title("Press Enter in terminal for next; 'q' then Enter to quit")
-
-def iter_subtraj_xy_from_items(items, xy_mode="achieved_goal"):
-    """
-    items: list of tuples (s0, S, A, sT)
-    xy_mode:
-      - "achieved_goal": uses last 2 dims (because you concatenated [obs, ach])
-      - "obs": uses first 2 dims
-    """
-    for (s0, S, A, sT) in items:
-        if xy_mode == "achieved_goal":
-            yield S[:, -2:]
-        elif xy_mode == "obs":
-            yield S[:, :2]
-        else:
-            raise ValueError("xy_mode must be 'achieved_goal' or 'obs'")
-
-def plot_subtraj_bg(ax, all_xy, subtraj_xy, title=""):
-    ax.clear()
-    ax.scatter(all_xy[:, 0], all_xy[:, 1], s=2, alpha=0.15, color="lightgray", zorder=1)
-    if subtraj_xy is not None and len(subtraj_xy) > 0:
-        ax.plot(subtraj_xy[:, 0], subtraj_xy[:, 1], linewidth=2.5, zorder=3)
-        ax.scatter([subtraj_xy[0, 0]], [subtraj_xy[0, 1]], s=60, zorder=4)
-    ax.set_aspect("equal", "box")
-    ax.grid(True, alpha=0.25)
-    ax.set_title(title)
-
-def browse_items_terminal(all_xy, items, xy_mode="achieved_goal", start=0, label="kept"):
-    plt.ion()
-    fig, ax = plt.subplots(figsize=(6.8, 6.4))
-
-    gen = iter_subtraj_xy_from_items(items, xy_mode=xy_mode)
-    for _ in range(start):
-        next(gen, None)
-
-    i = start
-    while True:
-        sub_xy = next(gen, None)
-        if sub_xy is None:
-            print(f"Reached end of {label} items.")
-            break
-
-        plot_subtraj_bg(ax, all_xy, sub_xy,
-                        title=f"{label} subtraj {i} | Enter=next, q=quit")
-        fig.canvas.draw()
-        fig.canvas.flush_events()
-
-        cmd = input(f"[{label} {i}] Enter=next | q=quit: ").strip().lower()
-        if cmd == "q":
-            break
-        i += 1
-
-    plt.ioff()
-    plt.close(fig)
-
-print("kept:", len(train_ds.items), "removed:", len(train_ds.removed_items))
-
-# Browse kept
-# browse_items_terminal(all_xy, train_ds.items, xy_mode="achieved_goal", label="kept")
-
-# Browse removed
-# browse_items_terminal(all_xy, train_ds.removed_items, xy_mode="achieved_goal", label="removed")
-
 
 # find per-feature mean and std from all state_sequence timesteps in train_ds
 def compute_stats(ds):
@@ -334,6 +255,55 @@ def compute_loss_klbalancing(batch, beta, gamma):
 
     # w/ KL balancing
     log_prior_det = prior_dist.log_prob(z_detached).sum() / denom
+    kl_prior = (log_post.detach() - log_prior_det) # prior to match post
+    kl_loss = beta * kl_post + gamma * kl_prior
+
+    # TAWM over terminal state
+    mu_T, std_T = p_psi(s0, z_detached)                            
+    sT_dist = Independent(Normal(mu_T, std_T), 1)
+
+    # State decoder loss
+    sT_loss = -sT_dist.log_prob(sT).sum() / denom
+
+    # Overall loss (naive VI loss from paper)
+    loss = alpha * sT_loss + a_loss +  kl_loss
+    return {
+        "loss": loss,
+        "policy_loss": a_loss,
+        "kl_loss": kl_loss,
+        "state_decoder_loss": sT_loss
+    }
+
+
+def compute_loss_klbalancing_mog(batch, beta, gamma):
+    s0, S, A, sT = batch["s0"], batch["state_sequence"], batch["action_sequence"], batch["sT"]
+    B, T, _  = S.shape
+    denom = B * T
+
+    # State encoder
+    mu_q, std_q = q_phi(S, A)                      
+    z = mu_q + std_q * torch.randn_like(mu_q)
+
+    # Low-level policy pi_theta(a|s,z)
+    z_bt = z.unsqueeze(1).expand(B, T, -1)         
+    mu_pi, std_pi = pi_theta(S.reshape(B*T, -1), z_bt.reshape(B*T, -1))
+    mu_pi, std_pi = mu_pi.view(B, T, -1), std_pi.view(B, T, -1)
+    a_dist  = Independent(Normal(mu_pi, std_pi), 1)        
+
+    # Compute policy loss
+    a_loss  = -a_dist.log_prob(A).sum() / denom
+
+    log_prior = p_omega.log_prob(z, s0).sum() / denom
+    post_dist = Independent(Normal(mu_q,  std_q),  1)
+    log_post  = post_dist.log_prob(z).sum() / denom
+
+    kl_post = (log_post - log_prior.detach()) # post to match prior
+
+    # Detach gradient
+    z_detached = z.detach()
+
+    # w/ KL balancing
+    log_prior_det = p_omega.log_prob(z_detached, s0).sum() / denom
     kl_prior = (log_post.detach() - log_prior_det) # prior to match post
     kl_loss = beta * kl_post + gamma * kl_prior
 
