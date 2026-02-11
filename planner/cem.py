@@ -18,7 +18,7 @@ def cem_iter(x,cost_fn,frac_keep,l2_pen):
     k = int(N*frac_keep) 
     
     # evaluate solution candidates, get sorted inds
-    costs = cost_fn(x)
+    costs = cost_fn(x) # [B]
     l2_cost = l2_pen*torch.mean(torch.mean(x**2,dim=-1),dim=-1) # first take l2 penalty over actions, then over the whole horizon
     costs += l2_cost
     inds = torch.argsort(costs)
@@ -35,7 +35,7 @@ def cem_iter(x,cost_fn,frac_keep,l2_pen):
 def cem(x_mean,x_std,cost_fn,pop_size,frac_keep,n_iters,l2_pen):
     """
     Runs cem_iter for n_iters to repeatedly refine the distribution of the skill sequence.
-
+    (pop size is the batch size)
     """
     device = x_mean.device
     for _ in range(n_iters):
