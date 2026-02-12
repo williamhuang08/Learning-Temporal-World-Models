@@ -1,6 +1,8 @@
 '''File where we will sample a set of waypoints, and plan a sequence of skills to have our pointmass travel through those waypoints'''
 
 import minari
+import os
+import sys
 from model.skill_model import SkillPolicy, SkillPosterior, SkillPrior, TAWM, MoGSkillPrior
 from model.utils import load_checkpoint, pack_state_from_obs, read_antmaze_obs
 from utils import obs_to_state_vec, xy_from_state
@@ -8,11 +10,15 @@ import numpy as np
 import torch
 import gymnasium as gym
 from gymnasium.wrappers import TimeLimit
+from torch.utils.data import DataLoader
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 from cem import cem, cem_variable_length
+
+sys.path.append(os.path.abspath(".."))
+from utils import SubtrajDataset, make_episode_splits, collate
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -22,17 +28,18 @@ data = minari.load_dataset(env_name)
 env = data.recover_environment()
 
 def strip_timelimit(env):
+    "Recovers the innermost env and removes timelimit wrapper"
     while hasattr(env, "env") and env.__class__.__name__ == "TimeLimit":
         env = env.env
     return env
 
 env = strip_timelimit(env)
-env = TimeLimit(env, max_episode_steps=4000)
+env = TimeLimit(env, max_episode_steps=4000) # set maximum number of episode steps
 
 # Environment variables
 skill_seq_len = 10
 H = 40
-replan_freq = H 
+replan_freq = H
 state_dim = 29 # make sure to change these depending on the env!
 a_dim = 8
 h_dim = 256
@@ -65,8 +72,12 @@ init_state_dependent = True
 random_goal = False # determines if we select a goal at random from dataset (random_goal=True) or use pre-set one from environment
 
 # filename = 'antmaze_diverse_detached_250_1.pth'
-filename = 'one_optimizer/antmaze_diverse_detached_250_1.pth'
+filename = 'kl_balancing/antmaze_diverse_detached_klbalance_epoch75_beta1.0_gamma0.001.pth'
 PATH = '../checkpoints/' + filename
+
+OUTDIR = "planning"
+PLANS_DIR = os.path.join(OUTDIR, "plans_per_replan")
+os.makedirs(PLANS_DIR, exist_ok=True)
 
 skillpost = SkillPosterior(state_dim=state_dim, action_dim=a_dim).to(device)
 llpolicy = SkillPolicy(state_dim=state_dim, action_dim=a_dim).to(device)
@@ -75,15 +86,48 @@ skillprior = SkillPrior(state_dim=state_dim).to(device)
 # skillprior = MoGSkillPrior(state_dim=state_dim).to(device)
 _ = load_checkpoint(PATH, skillpost, llpolicy, tawm, skillprior)
 
-env.reset() # reset the env config start/end states
-obs = read_antmaze_obs(env)
-_, ag0, s0 = pack_state_from_obs(obs) # convert obs to a state
-s0_torch = torch.cat([torch.tensor(s0,dtype=torch.float32).to(device=device).reshape(1,1,-1) for _ in range(batch_size)])
-# [batch_size, 1, state_dim]: want to sample batch_size candidate skill seqs and score each skill seq starting from s0
 
-skill_seq = torch.zeros((1,skill_seq_len,z_dim),device=device) # [1, skill_seq_len, z_dim]
-print('skill_seq.shape: ', skill_seq.shape)
-skill_seq.requires_grad = True
+train_ids, val_ids, test_ids = make_episode_splits(
+    data, train=0.8, val=0.0, test=0.2, seed=0
+)
+print(f"train episodes:{len(train_ids)}  val episodes:{len(val_ids)}  test episodes:{len(test_ids)}")
+
+train_ds = SubtrajDataset(data, T=H, episode_ids=train_ids, stride=3)
+val_ds   = SubtrajDataset(data, T=H, episode_ids=val_ids,   stride=3)
+test_ds  = SubtrajDataset(data, T=H, episode_ids=test_ids,  stride=3)
+
+print(f"train subtrajs:{len(train_ds)}  val subtrajs:{len(val_ds)}  test subtrajs:{len(test_ds)}")
+
+B = 100  
+train_loader = DataLoader(train_ds, batch_size=B, shuffle=True,  collate_fn=collate, drop_last=False)
+val_loader   = DataLoader(val_ds,   batch_size=B, shuffle=False, collate_fn=collate, drop_last=False)
+test_loader  = DataLoader(test_ds,  batch_size=B, shuffle=False, collate_fn=collate, drop_last=False)
+
+def _get_start_xy_from_item(item):
+    s0, S, A, sT = item
+    return s0[-2:].astype(np.float32), S.astype(np.float32)
+
+def build_xy_cache(minari_dataset):
+    episodes_xy = []
+    starts = []
+    all_xy = []
+
+    # scan all subtrajectories
+    for i, item in enumerate(train_ds.items):
+        xy, states = _get_start_xy_from_item(item)
+        episodes_xy.append(states[:, -2:])
+        starts.append(xy)
+        all_xy.append(states[:, -2:])
+
+    return episodes_xy, np.stack(starts, axis=0), np.concatenate(all_xy, axis=0)
+
+episodes_xy, episodes_start_xy, all_xy = build_xy_cache(data)
+
+def pick_nearby_ep(episodes_start_xy, current_xy):
+    d2 = np.sum((episodes_start_xy - current_xy.reshape(1, 2))**2, axis=1)
+    idx = np.where(d2<=0.2**2)[0]
+    idx = idx[np.argsort(d2[idx])]
+    return idx[:40].tolist()
 
 def build_antmaze_background(minari_dataset, bins=300, stride=1):
     xs, ys = [], []
@@ -109,7 +153,7 @@ def build_antmaze_background(minari_dataset, bins=300, stride=1):
 
 @torch.no_grad()
 def mog_mean_std(skillprior, s):
-
+    "Review"
     logits, mean, std = skillprior(s)          
     k = logits.argmax(dim=-1)                  
     # gather along the mixture dimension (-2)
@@ -122,6 +166,7 @@ def mog_mean_std(skillprior, s):
 @torch.no_grad()
 def policy_action(llpolicy, state_vec, z_vec, deterministic=True):
     """
+    Review:
     Uses the low level policy to sample an action.
     """
     s = torch.tensor(state_vec, dtype=torch.float32, device=device).unsqueeze(0)  
@@ -239,16 +284,16 @@ def get_expected_cost_for_cem(s0, eps_seq, goal_xy, length_cost=0.0):
     goal_xy: [2] 
     returns: [B] costs or best cost [1]
     """
-    s = s0.squeeze(1)    
+    s = s0.squeeze(1) # [B, D]
 
-    goal_xy = goal_xy.view(1, 2).expand(s.shape[0], -1)  # [B,2]
+    goal_xy = goal_xy.view(1, 2).expand(s.shape[0], -1)  # [B,2] (keep second dimension (2) unchanged)
 
     B, L, _ = eps_seq.shape
 
     costs = []
+    pred_states = [s]
     # cost at t=0
     costs.append(((s[:, -2:] - goal_xy) ** 2).mean(dim=-1))
-
     for i in range(L):
         mu_z, sigma_z = skillprior(s)       
         # mu_z, sigma_z = mog_mean_std(skillprior, s)
@@ -257,19 +302,20 @@ def get_expected_cost_for_cem(s0, eps_seq, goal_xy, length_cost=0.0):
 
         s, _ = tawm(s, z_i)                   
         costs.append(((s[:, -2:] - goal_xy) ** 2).mean(dim=-1) + (i+1)*length_cost)
+        pred_states.append(s)
 
     costs = torch.stack(costs, dim=1) # [B,L+1]
     best, _ = torch.min(costs, dim=1)  # [B]
     return best
 
 def run_skills_iterative_replanning(env,
-    skill_seq_len=10,
-    H=40,
+    skill_seq_len=skill_seq_len,
+    H=H,
     execute_n_skills=1,   
-    max_replans=2000//40,
+    max_replans=40000//H,
     use_epsilon=True,
     goal_thresh2=1.0,
-    deterministic=True
+    deterministic=False
 ):
     """
     Starting at current state, use CEM to find the best skill sequence, execute the first skill, then replan and repeat
@@ -286,6 +332,7 @@ def run_skills_iterative_replanning(env,
     last_s0_vec = None
 
     for repl in range(max_replans):
+        cur_xy = state_vec[-2:].copy()
         # stop if already at goal
         if np.sum((state_vec[-2:] - goal_xy) ** 2) < goal_thresh2:
             print("Reached goal (before planning).")
@@ -307,30 +354,43 @@ def run_skills_iterative_replanning(env,
 
         last_eps_mean = eps_mean.detach().clone()
 
+        plan_means_xy, plan_stds_xy = tawm_plan_xy(state_vec, eps_mean, n_std = 1)
+
         # call run_skill_seq
         eps_exec = eps_mean[:execute_n_skills]  # (execute_n_skills, Z)
 
-        state_vec, executed_xy, done = run_skill_seq(env,state_vec,eps_exec,use_epsilon=use_epsilon,H=H,goal_xy=goal_xy,goal_thresh2=goal_thresh2,deterministic=deterministic,executed_xy=executed_xy)
+        state_vec, executed_xy, done, per_skill_exec_xy = run_skill_seq(env,state_vec,eps_exec,use_epsilon=use_epsilon,H=H,goal_xy=goal_xy,goal_thresh2=goal_thresh2,deterministic=deterministic,executed_xy=executed_xy)
+
+        executed_skill_xy = per_skill_exec_xy[0]
 
         print(f"replan {repl}] xy={state_vec[-2:]} dist to the goal={np.sum((state_vec[-2:] - goal_xy)**2):.3f}")
+
+        # nearby_idx = pick_nearby_ep(episodes_start_xy, cur_xy)
+        # nearby_trajs = [episodes_xy[i] for i in nearby_idx]
+
+        outpath = os.path.join(PLANS_DIR, f"replan_{repl:05d}.png")
+        # save_replan_figure(outpath, all_xy, cur_xy, goal_xy, plan_means_xy, plan_stds_xy, executed_xy, executed_skill_xy, nearby_trajs, title=f"replan {repl}")
+        save_replan_figure(outpath, all_xy, cur_xy, goal_xy, plan_means_xy, plan_stds_xy, executed_xy, executed_skill_xy, title=f"replan {repl}")
 
         if done:
             break
 
+    save_final_trajectory(os.path.join(OUTDIR, f"final_executed_trajectory.png"), executed_xy, goal_xy)
     return np.stack(executed_xy, axis=0), goal_xy, last_s0_vec, last_eps_mean, first_state_vec, first_eps_mean
 
 
 def run_skill_seq(env, state_vec, eps_seq, use_epsilon=True, H=40,
-                  goal_xy=None, goal_thresh2=1.0, deterministic=True,
+                  goal_xy=None, goal_thresh2=1.0, deterministic=False,
                   executed_xy=None):
     """
-    Executes a skill seq using the policy and returns the new state (and xy-location).
+    Executes a skill seq using the policy and returns the new state (and xy-locations).
     """
     if executed_xy is None:
         executed_xy = [state_vec[-2:].copy()]
 
     L = eps_seq.shape[0]
     done = False
+    per_skill_exec_xy = []
 
     for i in range(L):
         # choose z for this skill
@@ -341,6 +401,7 @@ def run_skill_seq(env, state_vec, eps_seq, use_epsilon=True, H=40,
             # mu_z, sigma_z = mog_mean_std(skillprior, s_t)
             # z = mu_z + sigma_z * eps_seq[i:i+1, :]
 
+        skill_xy = []
         # execute low-level steps for H 
         for t in range(H):
             a = policy_action(llpolicy, state_vec, z, deterministic=deterministic)  
@@ -348,21 +409,25 @@ def run_skill_seq(env, state_vec, eps_seq, use_epsilon=True, H=40,
             done = terminated or truncated
 
             state_vec = obs_to_state_vec(obs)
-            executed_xy.append(state_vec[-2:].copy())
+            xy = state_vec[-2:].copy()
+            executed_xy.append(xy)
+            skill_xy.append(xy)
 
             if goal_xy is not None:
                 if np.sum((state_vec[-2:] - goal_xy) ** 2) < goal_thresh2:
-                    return state_vec, executed_xy, True
+                    per_skill_exec_xy.append(np.asarray(skill_xy, dtype=np.float32))
+                    return state_vec, executed_xy, True, per_skill_exec_xy
 
             if done:
-                return state_vec, executed_xy, True
-
-    return state_vec, executed_xy, False
+                per_skill_exec_xy.append(np.asarray(skill_xy, dtype=np.float32))
+                return state_vec, executed_xy, True, per_skill_exec_xy
+        per_skill_exec_xy.append(np.asarray(skill_xy, np.float32))
+    return state_vec, executed_xy, False, per_skill_exec_xy
 
 
 
 @torch.no_grad()
-def taww_plan_xy(s0_vec_np, eps_plan, n_std=2.0):
+def tawm_plan_xy(s0_vec_np, eps_plan, n_std=2.0):
     """
     Takes a skill sequence plan and plots the distributions by conditioning on each skill and previous state. 
     """
@@ -397,47 +462,6 @@ def add_green_blob(ax, xy, std_xy, n_std=2.0, alpha=0.20):
     ell = Ellipse(xy=(xy[0], xy[1]),width=2.0 * n_std * std_xy[0],height=2.0 * n_std * std_xy[1],angle=0.0,facecolor="green",edgecolor="green",alpha=alpha,linewidth=1.5,zorder=2,)
     ax.add_patch(ell)
 
-
-def plot_plan_blobs_vs_exec(env, executed_xy, plan_means_xy, plan_stds_xy, goal_xy, outpath="plan_blobs_vs_exec.png", n_std=2.0):
-    """
-    Plots executed trajectory, TAWM waypoints, and goal
-    """
-    exec_xy = np.asarray(executed_xy, dtype=np.float32)
-
-    fig, ax = plt.subplots(figsize=(6.5, 6))
-    fig, ax = plt.subplots(figsize=(6.5, 6))
-
-    # executed trajectory in red
-    if len(exec_xy) > 0:
-        ax.plot(exec_xy[:, 0], exec_xy[:, 1], color="red", linewidth=2.5, label="executed", zorder=3)
-        ax.scatter(exec_xy[0, 0], exec_xy[0, 1], color="red", s=60, zorder=4)
-
-    # planned means in green
-    ax.plot(plan_means_xy[:, 0], plan_means_xy[:, 1], linestyle="--", color="green",
-            linewidth=2.0, label="TAWM plan mean", zorder=2)
-
-    # green blobs along the plan
-    for i in range(1, len(plan_means_xy)):  
-        add_green_blob(ax, plan_means_xy[i], plan_stds_xy[i], n_std=n_std, alpha=0.18)
-
-    # goal
-    ax.scatter(goal_xy[0], goal_xy[1], s=140, marker="*", color="black", label="goal", zorder=5)
-
-    ax.set_aspect("equal", "box")
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="best")
-
-    # bounds
-    pts = np.vstack([exec_xy, plan_means_xy, goal_xy.reshape(1,2)]) if len(exec_xy) else np.vstack([plan_means_xy, goal_xy.reshape(1,2)])
-    lo, hi = pts.min(axis=0), pts.max(axis=0)
-    pad = 0.08 * (hi - lo + 1e-6)
-    ax.set_xlim(lo[0] - pad[0], hi[0] + pad[0])
-    ax.set_ylim(lo[1] - pad[1], hi[1] + pad[1])
-
-    plt.tight_layout()
-    plt.savefig(outpath, dpi=200)
-    plt.close(fig)
-    print(f"saved -> {outpath}")
 
 
 def plot_plan_blobs_vs_exec_with_bg(all_xy,
@@ -486,27 +510,115 @@ def plot_plan_blobs_vs_exec_with_bg(all_xy,
     plt.close(fig)
     print(f"saved -> {outpath}")
 
-exec_xy, goal_xy, last_s0_vec, last_eps_mean, first_s0_vec, first_eps_mean = run_skills_iterative_replanning(env,skill_seq_len=skill_seq_len,H=H,execute_n_skills=1,max_replans=max_replans,use_epsilon=True,goal_thresh2=1.0,deterministic=True)
+def save_replan_figure(
+    outpath,
+    all_xy,
+    current_xy,
+    goal_xy,
+    plan_means_xy,
+    plan_stds_xy,
+    executed_xy_so_far,
+    executed_skill_xy,               
+    # nearby_episode_xys,              
+    title=None,
+):
+    exec_xy = np.asarray(executed_xy_so_far, dtype=np.float32)
+    skill_xy = np.asarray(executed_skill_xy, dtype=np.float32) if executed_skill_xy is not None else None
 
-# bg_img, bg_extent, x_centers, y_centers, occ = build_antmaze_background(data, bins=320, stride=2)
+    fig, ax = plt.subplots(figsize=(7.2, 6.6))
+
+    # Background scatter (light)
+    if all_xy is not None and all_xy.shape[0] > 0:
+        ax.scatter(all_xy[:, 0], all_xy[:, 1], s=2, alpha=0.10, color="lightgray", zorder=1)
+
+    # # Nearby dataset subtrajectories (thin)
+    # for traj in nearby_episode_xys:
+    #     if traj.shape[0] > 1:
+    #         ax.plot(traj[:, 0], traj[:, 1], linewidth=1.0, alpha=0.25, zorder=2)
+
+    # Just-executed skill (red)
+    if skill_xy is not None and skill_xy.shape[0] > 0:
+        ax.plot(skill_xy[:, 0], skill_xy[:, 1], color="red", linewidth=3.0, alpha=0.95, label="executed skill", zorder=6)
+
+    # Current position
+    ax.scatter(current_xy[0], current_xy[1], s=80, marker="o", color="blue", label="current", zorder=7)
+
+    # Plan mean + blobs
+    ax.plot(plan_means_xy[:, 0], plan_means_xy[:, 1], linestyle="--", color="green",
+            linewidth=2.0, label="TAWM plan mean", zorder=5)
+    for i in range(1, len(plan_means_xy)):
+        add_green_blob(ax, plan_means_xy[i], plan_stds_xy[i], n_std=1, alpha=0.18)
+
+    # Goal
+    ax.scatter(goal_xy[0], goal_xy[1], s=160, marker="*", color="black", label="goal", zorder=8)
+
+    ax.set_aspect("equal", "box")
+    ax.grid(True, alpha=0.25)
+    if title is not None:
+        ax.set_title(title)
+
+    ax.legend(loc="best")
+
+    # Bounds
+    pts = [current_xy.reshape(1,2), goal_xy.reshape(1,2), plan_means_xy]
+    if exec_xy.shape[0] > 0:
+        pts.append(exec_xy)
+    if skill_xy is not None and skill_xy.shape[0] > 0:
+        pts.append(skill_xy)
+    pts = np.vstack(pts)
+    lo, hi = pts.min(axis=0), pts.max(axis=0)
+    pad = 0.10 * (hi - lo + 1e-6)
+    ax.set_xlim(lo[0] - pad[0], hi[0] + pad[0])
+    ax.set_ylim(lo[1] - pad[1], hi[1] + pad[1])
+
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=220)
+    plt.close(fig)
+    print(f"saved -> {outpath}")
+
+def save_final_trajectory(outpath, executed_xy, goal_xy):
+    exec_xy = np.asarray(executed_xy, dtype=np.float32)
+    fig, ax = plt.subplots(figsize=(7.0, 6.5))
+
+    if exec_xy.shape[0] > 1:
+        ax.plot(exec_xy[:, 0], exec_xy[:, 1], color="red", linewidth=3.0, zorder=2, label="executed")
+        ax.scatter(exec_xy[0, 0], exec_xy[0, 1], s=60, color="red", zorder=3)
+
+    ax.scatter(goal_xy[0], goal_xy[1], s=170, marker="*", color="black", zorder=4, label="goal")
+
+    ax.set_aspect("equal", "box")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best")
+
+    pts = np.vstack([exec_xy, goal_xy.reshape(1,2)]) if exec_xy.size else goal_xy.reshape(1,2)
+    lo, hi = pts.min(axis=0), pts.max(axis=0)
+    pad = 0.10 * (hi - lo + 1e-6)
+    ax.set_xlim(lo[0] - pad[0], hi[0] + pad[0])
+    ax.set_ylim(lo[1] - pad[1], hi[1] + pad[1])
+
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=240)
+    plt.close(fig)
+    print(f"saved -> {outpath}")
+
+
+exec_xy, goal_xy, last_s0_vec, last_eps_mean, first_s0_vec, first_eps_mean = run_skills_iterative_replanning(env,skill_seq_len=skill_seq_len,H=H,execute_n_skills=1,max_replans=max_replans,use_epsilon=True,goal_thresh2=1.0,deterministic=False)
+
+env.close()
 
 # if last_eps_mean is not None and last_s0_vec is not None:
+#     ant_maze_dataset = minari.load_dataset('D4RL/antmaze/medium-diverse-v1')
+
 #     planned_means_xy, planned_stds_xy = taww_plan_xy(first_s0_vec, first_eps_mean)
-#     plot_plan_blobs_vs_exec(env, exec_xy, planned_means_xy, planned_stds_xy, goal_xy,
-#                             outpath="plan_blobs_vs_exec.png", n_std=2.0)
-if last_eps_mean is not None and last_s0_vec is not None:
-    ant_maze_dataset = minari.load_dataset('D4RL/antmaze/medium-diverse-v1')
 
-    planned_means_xy, planned_stds_xy = taww_plan_xy(first_s0_vec, first_eps_mean)
+#     all_xy = []
+#     for ep in ant_maze_dataset.iterate_episodes():
+#         xy = ep.observations["achieved_goal"][:, :2]  
+#         all_xy.append(xy)
 
-    all_xy = []
-    for ep in ant_maze_dataset.iterate_episodes():
-        xy = ep.observations["achieved_goal"][:, :2]  
-        all_xy.append(xy)
-
-    all_xy = np.concatenate(all_xy, axis=0)
-    plot_plan_blobs_vs_exec_with_bg(
-        all_xy, exec_xy, planned_means_xy, planned_stds_xy, goal_xy ,outpath="plan_blobs_vs_exec_bg.png",
-        n_std=2.0
-    )
+#     all_xy = np.concatenate(all_xy, axis=0)
+#     plot_plan_blobs_vs_exec_with_bg(
+#         all_xy, exec_xy, planned_means_xy, planned_stds_xy, goal_xy ,outpath="plan_blobs_vs_exec_bg.png",
+#         n_std=2.0
+#     )
 
