@@ -37,6 +37,7 @@ env = strip_timelimit(env)
 env = TimeLimit(env, max_episode_steps=4000) # set maximum number of episode steps
 
 # Environment variables
+prior_type = "mog"
 skill_seq_len = 10
 H = 40
 replan_freq = H
@@ -72,18 +73,20 @@ init_state_dependent = True
 random_goal = False # determines if we select a goal at random from dataset (random_goal=True) or use pre-set one from environment
 
 # filename = 'antmaze_diverse_detached_250_1.pth'
-filename = 'kl_balancing/antmaze_diverse_detached_klbalance_epoch75_beta1.0_gamma0.001.pth'
+# filename = 'kl_balancing/antmaze_diverse_detached_klbalance_epoch75_beta1.0_gamma0.001.pth'
+filename = 'kl_balancing_MoG/beta_gamma/antmaze_diverse_detached_klbalance_mog_50_beta0.001_gamma1.pth'
+
 PATH = '../checkpoints/' + filename
 
 OUTDIR = "planning"
-PLANS_DIR = os.path.join(OUTDIR, "plans_per_replan")
+PLANS_DIR = os.path.join(OUTDIR, "plans_per_replan4")
 os.makedirs(PLANS_DIR, exist_ok=True)
 
 skillpost = SkillPosterior(state_dim=state_dim, action_dim=a_dim).to(device)
 llpolicy = SkillPolicy(state_dim=state_dim, action_dim=a_dim).to(device)
 tawm = TAWM(state_dim=state_dim).to(device)
-skillprior = SkillPrior(state_dim=state_dim).to(device)
-# skillprior = MoGSkillPrior(state_dim=state_dim).to(device)
+# skillprior = SkillPrior(state_dim=state_dim).to(device)
+skillprior = MoGSkillPrior(state_dim=state_dim).to(device)
 _ = load_checkpoint(PATH, skillpost, llpolicy, tawm, skillprior)
 
 
@@ -155,7 +158,7 @@ def build_antmaze_background(minari_dataset, bins=300, stride=1):
 def mog_mean_std(skillprior, s):
     "Review"
     logits, mean, std = skillprior(s)          
-    k = logits.argmax(dim=-1)                  
+    k = torch.distributions.Categorical(logits=logits).sample()                 
     # gather along the mixture dimension (-2)
     idx = k.unsqueeze(-1).unsqueeze(-1).expand(*mean.shape[:-2], 1, mean.shape[-1]) 
     mu_k  = mean.gather(dim=-2, index=idx).squeeze(-2)   
@@ -182,7 +185,7 @@ def policy_action(llpolicy, state_vec, z_vec, deterministic=True):
     a = torch.tanh(a)
     return a.squeeze(0).cpu().numpy()
 
-def convert_epsilon_to_z(epsilon, s0_vec):
+def convert_epsilon_to_z(epsilon, s0_vec, prior_type):
     """
     Converts sequence of epsilons to a sequence of skills.
 
@@ -196,18 +199,19 @@ def convert_epsilon_to_z(epsilon, s0_vec):
 
     z_seq = []
     for i in range(L):
-        mu_z, sigma_z = skillprior(s) # [B,Z]
-        eps_i = epsilon[:, i, :] # [B,Z]
-        z_i = mu_z + sigma_z * eps_i # [B,Z]
-        z_seq.append(z_i.unsqueeze(1)) # [B,1,Z]
-
-        # logits, mu_z, sigma_z = skillprior(s) # [B,Z]
-        # k = torch.distributions.Categorical(logits=logits).sample().item()
-        # mu_k  = mu_z[0, k]                             
-        # std_k = sigma_z[0, k]    
-        # eps_i = epsilon[:, i, :] # [B,Z]
-        # z_i = mu_k + std_k * eps_i # [B,Z]
-        # z_seq.append(z_i.unsqueeze(1)) # [B,1,Z]
+        if prior_type == "uni":
+            mu_z, sigma_z = skillprior(s) # [B,Z]
+            eps_i = epsilon[:, i, :] # [B,Z]
+            z_i = mu_z + sigma_z * eps_i # [B,Z]
+            z_seq.append(z_i.unsqueeze(1)) # [B,1,Z]
+        else:   
+            logits, mu_z, sigma_z = skillprior(s) # [B,Z]
+            k = torch.distributions.Categorical(logits=logits).sample().item()
+            mu_k  = mu_z[0, k]                             
+            std_k = sigma_z[0, k]    
+            eps_i = epsilon[:, i, :] # [B,Z]
+            z_i = mu_k + std_k * eps_i # [B,Z]
+            z_seq.append(z_i.unsqueeze(1)) # [B,1,Z]
         
         s_mean, _ = tawm(s, z_i)
         s = s_mean
@@ -275,7 +279,7 @@ def get_expected_cost_variable_length(s0, skill_seq, lengths, goal_state, use_ep
 			plt.savefig('pred_states_cem_variable_length_FULL_SEQ')
 		return costs
 
-def get_expected_cost_for_cem(s0, eps_seq, goal_xy, length_cost=0.0):
+def get_expected_cost_for_cem(s0, eps_seq, goal_xy, prior_type, length_cost=0.0):
     """
     Returns the cost of the eps_seq which is the minimum distance along the whole skill sequence to the goal.
 
@@ -295,8 +299,11 @@ def get_expected_cost_for_cem(s0, eps_seq, goal_xy, length_cost=0.0):
     # cost at t=0
     costs.append(((s[:, -2:] - goal_xy) ** 2).mean(dim=-1))
     for i in range(L):
-        mu_z, sigma_z = skillprior(s)       
-        # mu_z, sigma_z = mog_mean_std(skillprior, s)
+        if prior_type == "uni":
+            mu_z, sigma_z = skillprior(s)       
+        else:
+            mu_z, sigma_z = mog_mean_std(skillprior, s)
+
         eps_i = eps_seq[:, i, :]
         z_i = mu_z + sigma_z * eps_i           
 
@@ -330,6 +337,7 @@ def run_skills_iterative_replanning(env,
     first_eps_mean = None
     last_eps_mean = None
     last_s0_vec = None
+    all_s0 = [state_vec[-2:].copy()]
 
     for repl in range(max_replans):
         cur_xy = state_vec[-2:].copy()
@@ -338,12 +346,13 @@ def run_skills_iterative_replanning(env,
             print("Reached goal (before planning).")
             break
 
+        all_s0.append(cur_xy.copy())
         # CEM
         last_s0_vec = state_vec.copy()
         s_batch = torch.tensor(state_vec, dtype=torch.float32, device=device).view(1,1,-1).expand(batch_size, 1, state_dim)   # [B,1,sd]
         goal_xy_t = torch.tensor(goal_xy, dtype=torch.float32, device=device)
 
-        cost_fn = lambda eps_seq: get_expected_cost_for_cem(s_batch, eps_seq, goal_xy_t,length_cost=plan_length_cost)
+        cost_fn = lambda eps_seq: get_expected_cost_for_cem(s_batch, eps_seq, goal_xy_t, prior_type, length_cost=plan_length_cost)
 
         eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
         eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
@@ -354,32 +363,32 @@ def run_skills_iterative_replanning(env,
 
         last_eps_mean = eps_mean.detach().clone()
 
-        plan_means_xy, plan_stds_xy = tawm_plan_xy(state_vec, eps_mean, n_std = 1)
+        plan_means_xy, plan_stds_xy = tawm_plan_xy(state_vec, eps_mean, prior_type, n_std = 1)
 
         # call run_skill_seq
         eps_exec = eps_mean[:execute_n_skills]  # (execute_n_skills, Z)
 
-        state_vec, executed_xy, done, per_skill_exec_xy = run_skill_seq(env,state_vec,eps_exec,use_epsilon=use_epsilon,H=H,goal_xy=goal_xy,goal_thresh2=goal_thresh2,deterministic=deterministic,executed_xy=executed_xy)
+        state_vec, executed_xy, done, per_skill_exec_xy = run_skill_seq(env,state_vec,eps_exec,prior_type,use_epsilon=use_epsilon,H=H,goal_xy=goal_xy,goal_thresh2=goal_thresh2,deterministic=deterministic,executed_xy=executed_xy)
 
         executed_skill_xy = per_skill_exec_xy[0]
 
         print(f"replan {repl}] xy={state_vec[-2:]} dist to the goal={np.sum((state_vec[-2:] - goal_xy)**2):.3f}")
 
-        # nearby_idx = pick_nearby_ep(episodes_start_xy, cur_xy)
-        # nearby_trajs = [episodes_xy[i] for i in nearby_idx]
+        nearby_idx = pick_nearby_ep(episodes_start_xy, cur_xy)
+        nearby_trajs = [episodes_xy[i] for i in nearby_idx]
 
         outpath = os.path.join(PLANS_DIR, f"replan_{repl:05d}.png")
-        # save_replan_figure(outpath, all_xy, cur_xy, goal_xy, plan_means_xy, plan_stds_xy, executed_xy, executed_skill_xy, nearby_trajs, title=f"replan {repl}")
-        save_replan_figure(outpath, all_xy, cur_xy, goal_xy, plan_means_xy, plan_stds_xy, executed_xy, executed_skill_xy, title=f"replan {repl}")
+        save_replan_figure(outpath, all_xy, cur_xy, goal_xy, plan_means_xy, plan_stds_xy, executed_xy, executed_skill_xy, nearby_trajs, title=f"replan {repl}")
+        # save_replan_figure(outpath, all_xy, cur_xy, goal_xy, plan_means_xy, plan_stds_xy, executed_xy, executed_skill_xy, title=f"replan {repl}")
 
         if done:
             break
 
-    save_final_trajectory(os.path.join(OUTDIR, f"final_executed_trajectory.png"), executed_xy, goal_xy)
-    return np.stack(executed_xy, axis=0), goal_xy, last_s0_vec, last_eps_mean, first_state_vec, first_eps_mean
+    save_final_trajectory(os.path.join(OUTDIR, f"final_executed_trajectory.png"), executed_xy, goal_xy, all_s0)
+    return np.stack(executed_xy, axis=0), goal_xy, last_s0_vec, last_eps_mean, first_state_vec, first_eps_mean, all_s0
 
 
-def run_skill_seq(env, state_vec, eps_seq, use_epsilon=True, H=40,
+def run_skill_seq(env, state_vec, eps_seq, prior_type, use_epsilon=True, H=40,
                   goal_xy=None, goal_thresh2=1.0, deterministic=False,
                   executed_xy=None):
     """
@@ -396,10 +405,12 @@ def run_skill_seq(env, state_vec, eps_seq, use_epsilon=True, H=40,
         # choose z for this skill
         s_t = torch.tensor(state_vec, dtype=torch.float32, device=device).unsqueeze(0)  # [1,sd]
         if use_epsilon:
-            mu_z, sigma_z = skillprior(s_t)                         
-            z = mu_z + sigma_z * eps_seq[i:i+1, :]  
-            # mu_z, sigma_z = mog_mean_std(skillprior, s_t)
-            # z = mu_z + sigma_z * eps_seq[i:i+1, :]
+            if prior_type == "uni":
+                mu_z, sigma_z = skillprior(s_t)                         
+                z = mu_z + sigma_z * eps_seq[i:i+1, :]  
+            else:
+                mu_z, sigma_z = mog_mean_std(skillprior, s_t)
+                z = mu_z + sigma_z * eps_seq[i:i+1, :]
 
         skill_xy = []
         # execute low-level steps for H 
@@ -427,7 +438,7 @@ def run_skill_seq(env, state_vec, eps_seq, use_epsilon=True, H=40,
 
 
 @torch.no_grad()
-def tawm_plan_xy(s0_vec_np, eps_plan, n_std=2.0):
+def tawm_plan_xy(s0_vec_np, eps_plan, prior_type, n_std=2.0):
     """
     Takes a skill sequence plan and plots the distributions by conditioning on each skill and previous state. 
     """
@@ -438,10 +449,12 @@ def tawm_plan_xy(s0_vec_np, eps_plan, n_std=2.0):
 
     L = eps_plan.shape[0]
     for i in range(L):
-        mu_z, sigma_z = skillprior(s)              
-        z = mu_z + sigma_z * eps_plan[i:i+1, :] 
-        # mu_z, sigma_z = mog_mean_std(skillprior, s)
-        # z = mu_z + sigma_z * eps_plan[i:i+1, :]  
+        if prior_type == "uni":
+            mu_z, sigma_z = skillprior(s)              
+            z = mu_z + sigma_z * eps_plan[i:i+1, :] 
+        else:
+            mu_z, sigma_z = mog_mean_std(skillprior, s)
+            z = mu_z + sigma_z * eps_plan[i:i+1, :]  
 
         s_mean, s_std = tawm(s, z)                
         s = s_mean                                 
@@ -519,7 +532,7 @@ def save_replan_figure(
     plan_stds_xy,
     executed_xy_so_far,
     executed_skill_xy,               
-    # nearby_episode_xys,              
+    nearby_episode_xys,              
     title=None,
 ):
     exec_xy = np.asarray(executed_xy_so_far, dtype=np.float32)
@@ -532,9 +545,9 @@ def save_replan_figure(
         ax.scatter(all_xy[:, 0], all_xy[:, 1], s=2, alpha=0.10, color="lightgray", zorder=1)
 
     # # Nearby dataset subtrajectories (thin)
-    # for traj in nearby_episode_xys:
-    #     if traj.shape[0] > 1:
-    #         ax.plot(traj[:, 0], traj[:, 1], linewidth=1.0, alpha=0.25, zorder=2)
+    for traj in nearby_episode_xys:
+        if traj.shape[0] > 1:
+            ax.plot(traj[:, 0], traj[:, 1], linewidth=1.0, alpha=0.25, zorder=2)
 
     # Just-executed skill (red)
     if skill_xy is not None and skill_xy.shape[0] > 0:
@@ -576,13 +589,15 @@ def save_replan_figure(
     plt.close(fig)
     print(f"saved -> {outpath}")
 
-def save_final_trajectory(outpath, executed_xy, goal_xy):
+def save_final_trajectory(outpath, executed_xy, goal_xy, all_s0):
     exec_xy = np.asarray(executed_xy, dtype=np.float32)
     fig, ax = plt.subplots(figsize=(7.0, 6.5))
 
     if exec_xy.shape[0] > 1:
         ax.plot(exec_xy[:, 0], exec_xy[:, 1], color="red", linewidth=3.0, zorder=2, label="executed")
         ax.scatter(exec_xy[0, 0], exec_xy[0, 1], s=60, color="red", zorder=3)
+
+    # ax.scatter(all_s0[:, 0], all_s0[:, 1], s=170, marker="*", color="green", zorder=4, label="skill start")
 
     ax.scatter(goal_xy[0], goal_xy[1], s=170, marker="*", color="black", zorder=4, label="goal")
 
@@ -602,7 +617,7 @@ def save_final_trajectory(outpath, executed_xy, goal_xy):
     print(f"saved -> {outpath}")
 
 
-exec_xy, goal_xy, last_s0_vec, last_eps_mean, first_s0_vec, first_eps_mean = run_skills_iterative_replanning(env,skill_seq_len=skill_seq_len,H=H,execute_n_skills=1,max_replans=max_replans,use_epsilon=True,goal_thresh2=1.0,deterministic=False)
+exec_xy, goal_xy, last_s0_vec, last_eps_mean, first_s0_vec, first_eps_mean, all_s0 = run_skills_iterative_replanning(env,skill_seq_len=skill_seq_len,H=H,execute_n_skills=1,max_replans=max_replans,use_epsilon=True,goal_thresh2=1.0,deterministic=False)
 
 env.close()
 
