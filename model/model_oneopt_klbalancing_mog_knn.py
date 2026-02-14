@@ -342,7 +342,7 @@ def build_xy_cache(minari_dataset):
         start_s0.append(s0)
         all_xy.append(states[:, -2:])
 
-    return episodes_xy, np.stack(starts, axis=0), np.stack(start_s0, axis=0), np.concatenate(all_xy, axis=0)
+    return torch.tensor(episodes_xy, device=device), torch.tensor(np.stack(starts, axis=0),  device=device), torch.tensor(np.stack(start_s0, axis=0), device=device), torch.tensor(np.concatenate(all_xy, axis=0),  device=device)
 
 train_episodes_xy, train_episodes_start_xy, train_episodes_start, train_all_xy = build_xy_cache(train_ds)
 
@@ -412,13 +412,13 @@ def compute_loss_klbalancing_mog_knn(batch, beta, gamma):
 
     curr_logits, curr_mu_pr, curr_std_pr = p_omega(s0)
     B, n_neighbors, state_dim = neighbor_s0.shape
-    neigh_logits, neigh_mu_pr, neigh_std_pr = p_omega(torch.tensor(neighbor_s0.reshape(B * n_neighbors, 29)))
+    neigh_logits, neigh_mu_pr, neigh_std_pr = p_omega(neighbor_s0.reshape(B * n_neighbors, 29))
 
     neigh_logits = neigh_logits.reshape(B, n_neighbors, -1)
     neigh_mu_pr = neigh_mu_pr.reshape(B, n_neighbors, -1)
     neigh_std_pr = neigh_std_pr.reshape(B, n_neighbors, -1)
 
-    knn_kl = mc_kl_neighbors(curr_logits, curr_mu_pr, curr_std_pr, neigh_logits, neigh_mu_pr, neigh_std_pr)
+    knn_kl = mc_kl_neighbors(curr_logits, curr_mu_pr, curr_std_pr, neigh_logits, neigh_mu_pr, neigh_std_pr).sum() / (B*10)
 
     # State encoder
     mu_q, std_q = q_phi(S, A)                      

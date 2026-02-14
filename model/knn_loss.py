@@ -248,7 +248,7 @@ for batch in train_loader:
         neigh_std_pr = neigh_std_pr.reshape(B, n_neighbors, -1)
 
         knn_kll = mc_kl_neighbors(curr_logits, curr_mu_pr, curr_std_pr, neigh_logits, neigh_mu_pr, neigh_std_pr)
-        print(knn_kll)
+        print(knn_kll.sum()/(B * 10))
 
         # now compute the kl divergence between current MoG and all 20 MoG
         # print(log_density.shape)
