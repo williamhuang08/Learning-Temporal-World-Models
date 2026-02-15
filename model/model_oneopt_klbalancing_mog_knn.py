@@ -20,6 +20,7 @@ import os
 import argparse
 
 from skill_model import SkillPolicy, SkillPosterior, SkillPrior, TAWM, MoGSkillPrior
+from knn_loss import pick_nearby_ep, mc_kl_neighbors
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -346,61 +347,6 @@ def build_xy_cache(minari_dataset):
 
 train_episodes_xy, train_episodes_start_xy, train_episodes_start, train_all_xy = build_xy_cache(train_ds)
 
-def pick_nearby_ep(episodes_start_xy, current_xy):
-    # want to find distances betwqeen all elements inthe batch with all elements in the dataset
-    # goal shape # [B, 100]
-    # [B, 1, 2] and [1, 100, 2] 
-    n_neighbors = 10
-    d2 = torch.sum((episodes_start_xy[:, None, :] - current_xy[None, :, :])**2, dim=2)
-    idx = torch.empty(current_xy.shape[0], n_neighbors).to(torch.int64)
-    # rng = np.random.default_rng()
-    for i in range(current_xy.shape[0]):
-        idx[i] = torch.argsort(d2[i])[:n_neighbors]
-    return idx
-
-LOG_2PI = math.log(2.0 * math.pi)
-
-def log_normal_diag(z, mu, std):
-    var = std * std + 1e-8
-    return -0.5 * (((z - mu) ** 2) / var + torch.log(var) + LOG_2PI).sum(dim=-1)
-
-def log_mog_diag(z, logits, mu, std):
-    log_pi = F.log_softmax(logits, dim=-1)                
-    z_  = z[:, :, None, :]                                 
-    mu_ = mu[:, None, :, :]                                
-    st_ = std[:, None, :, :]                               
-    log_n = log_normal_diag(z_, mu_, st_)                  
-    return torch.logsumexp(log_pi[:, None, :] + log_n, dim=-1)  
-
-
-def mc_kl_neighbors(curr_logits, curr_mu, curr_std, neigh_logits, neigh_mu, neigh_std):
-    num_samples = 5
-    B, n_neighbors, K = neigh_logits.shape
-    z_dim = curr_mu.shape[-1]
-
-    cat = torch.distributions.Categorical(logits=curr_logits)
-    k_idx = cat.sample((num_samples,)).transpose(0, 1)               
-
-    mu_sel = curr_mu.gather(1, k_idx[..., None].expand(B, num_samples, z_dim))   
-    std_sel = curr_std.gather(1, k_idx[..., None].expand(B, num_samples, z_dim))  
-
-    eps = torch.randn_like(mu_sel)
-    z = mu_sel + std_sel * eps
-
-    logp = log_mog_diag(z, curr_logits, curr_mu, curr_std)
-
-
-    neigh_logits = neigh_logits.reshape(B * n_neighbors, -1)
-    neigh_mu = neigh_mu.reshape(B * n_neighbors, K, -1)
-    neigh_std = neigh_std.reshape(B * n_neighbors, K, -1)
-
-    z_resp = z[:, None, :, :].expand(B, n_neighbors, num_samples, z_dim).reshape(B * n_neighbors, num_samples, z_dim)
-    logq = log_mog_diag(z_resp, neigh_logits, neigh_mu, neigh_std)
-
-    logq = logq.reshape(B, n_neighbors, num_samples)
-    kl = (logp[:, None, :] - logq).mean(dim=-1)
-    return kl.mean()
-
 def compute_loss_klbalancing_mog_knn(batch, beta, gamma):
     s0, S, A, sT = batch["s0"], batch["state_sequence"], batch["action_sequence"], batch["sT"]
     B, T, _  = S.shape
@@ -414,11 +360,13 @@ def compute_loss_klbalancing_mog_knn(batch, beta, gamma):
     B, n_neighbors, state_dim = neighbor_s0.shape
     neigh_logits, neigh_mu_pr, neigh_std_pr = p_omega(neighbor_s0.reshape(B * n_neighbors, 29))
 
-    neigh_logits = neigh_logits.reshape(B, n_neighbors, -1)
-    neigh_mu_pr = neigh_mu_pr.reshape(B, n_neighbors, -1)
-    neigh_std_pr = neigh_std_pr.reshape(B, n_neighbors, -1)
+    K = neigh_logits.shape[-1]
+    z_dim = curr_mu_pr.shape[-1]
+    neigh_logits = neigh_logits.reshape(B, n_neighbors, K)
+    neigh_mu_pr = neigh_mu_pr.reshape(B, n_neighbors, K, z_dim)
+    neigh_std_pr = neigh_std_pr.reshape(B, n_neighbors, K, z_dim)
 
-    knn_kl = mc_kl_neighbors(curr_logits, curr_mu_pr, curr_std_pr, neigh_logits, neigh_mu_pr, neigh_std_pr).sum() / (B*10)
+    knn_kl = mc_kl_neighbors(curr_logits, curr_mu_pr, curr_std_pr, neigh_logits, neigh_mu_pr, neigh_std_pr)
 
     # State encoder
     mu_q, std_q = q_phi(S, A)                      

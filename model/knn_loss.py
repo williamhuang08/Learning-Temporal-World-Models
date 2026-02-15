@@ -149,39 +149,48 @@ val_loader = DataLoader(val_ds, batch_size=B, shuffle=False, collate_fn=collate,
 test_ds.stats = (S_mean, S_std)
 test_loader = DataLoader(test_ds, batch_size=B, shuffle=False, collate_fn=collate, drop_last=False)
 
-def _get_start_xy_from_item(item):
+def get_start_xy_from_item(item):
     s0, S, A, sT = item
     return s0[-2:].astype(np.float32), s0.astype(np.float32), S.astype(np.float32)
 
-def build_xy_cache(minari_dataset):
-    episodes_xy = []
+def build_xy_cache(train_ds):
     starts = []
-    all_xy = []
     start_s0 = []
+    all_xy = []
 
-    # scan all subtrajectories
-    for i, item in enumerate(train_ds.items):
-        xy, s0, states = _get_start_xy_from_item(item)
-        episodes_xy.append(states[:, -2:])
-        starts.append(xy)
-        start_s0.append(s0)
-        all_xy.append(states[:, -2:])
+    for item in train_ds.items:
+        s0, S, A, sT = item
+        starts.append(s0[-2:].astype(np.float32))      
+        start_s0.append(s0.astype(np.float32))         
+        all_xy.append(S[:, -2:].astype(np.float32))    
 
-    return episodes_xy, np.stack(starts, axis=0), np.stack(start_s0, axis=0), np.concatenate(all_xy, axis=0)
+    starts_np = np.stack(starts, axis=0)            
+    start_s0_np = np.stack(start_s0, axis=0)           
+    all_xy_np = np.concatenate(all_xy, axis=0)       
 
-train_episodes_xy, train_episodes_start_xy, train_episodes_start, train_all_xy = build_xy_cache(train_ds)
+    return (torch.as_tensor(starts_np,   device=device),torch.as_tensor(start_s0_np, device=device),torch.as_tensor(all_xy_np,   device=device),   )
+
+train_episodes_start_xy, train_episodes_start, train_all_xy = build_xy_cache(train_ds)
+
 
 def pick_nearby_ep(episodes_start_xy, current_xy):
     # want to find distances betwqeen all elements inthe batch with all elements in the dataset
     # goal shape # [B, 100]
     # [B, 1, 2] and [1, 100, 2] 
-    n_neighbors = 10
-    d2 = torch.sum((episodes_start_xy[:, None, :] - current_xy[None, :, :])**2, dim=2)
-    idx = torch.empty(current_xy.shape[0], n_neighbors).to(torch.int64)
+    n_neighbors = 15
+    r = 0.2
+    d2 = torch.sum((current_xy[:, None, :] - episodes_start_xy[None, :, :])**2, dim=2)
+    idx = torch.empty((current_xy.shape[0], n_neighbors), device=device).to(torch.int64)
+
     # rng = np.random.default_rng()
     for i in range(current_xy.shape[0]):
-        idx[i] = torch.argsort(d2[i])[:n_neighbors]
-    print(idx)
+        mask = d2[i] < (r * r)      
+        cands = torch.nonzero(mask, as_tuple=False).squeeze(1)  
+        if cands.numel() >= n_neighbors:
+            perm = torch.randperm(cands.numel(), device=d2.device)[:n_neighbors]
+            idx[i] = cands[perm]
+        else:
+            idx[i] = torch.argsort(d2[i])[:n_neighbors]
     return idx
 
 LOG_2PI = math.log(2.0 * math.pi)
@@ -200,7 +209,7 @@ def log_mog_diag(z, logits, mu, std):
 
 
 def mc_kl_neighbors(curr_logits, curr_mu, curr_std, neigh_logits, neigh_mu, neigh_std):
-    num_samples = 5
+    num_samples = 10
     B, n_neighbors, K = neigh_logits.shape
     z_dim = curr_mu.shape[-1]
 
@@ -233,23 +242,22 @@ for batch in train_loader:
         s0, S, A, sT = batch["s0"], batch["state_sequence"], batch["action_sequence"], batch["sT"]
         print(s0.shape)
         s0_xy = s0[:, -2:]
-        indices = pick_nearby_ep(torch.tensor(train_episodes_start_xy), s0_xy)
-        neighbor_s0 = train_episodes_start[indices]
 
-        mu_q, std_q = q_phi(S, A)                      
-        z = mu_q + std_q * torch.randn_like(mu_q)
+        indices = pick_nearby_ep(train_episodes_start_xy, s0_xy)
+        neighbor_s0 = train_episodes_start[indices]
 
         curr_logits, curr_mu_pr, curr_std_pr = p_omega(s0)
         B, n_neighbors, state_dim = neighbor_s0.shape
-        neigh_logits, neigh_mu_pr, neigh_std_pr = p_omega(torch.tensor(neighbor_s0.reshape(B * n_neighbors, 29)))
+        neigh_logits, neigh_mu_pr, neigh_std_pr = p_omega(neighbor_s0.reshape(B * n_neighbors, 29))
 
-        neigh_logits = neigh_logits.reshape(B, n_neighbors, -1)
-        neigh_mu_pr = neigh_mu_pr.reshape(B, n_neighbors, -1)
-        neigh_std_pr = neigh_std_pr.reshape(B, n_neighbors, -1)
+        K = neigh_logits.shape[-1]
+        z_dim = curr_mu_pr.shape[-1]
+        neigh_logits = neigh_logits.reshape(B, n_neighbors, K)
+        neigh_mu_pr = neigh_mu_pr.reshape(B, n_neighbors, K, z_dim)
+        neigh_std_pr = neigh_std_pr.reshape(B, n_neighbors, K, z_dim)
 
-        knn_kll = mc_kl_neighbors(curr_logits, curr_mu_pr, curr_std_pr, neigh_logits, neigh_mu_pr, neigh_std_pr)
-        print(knn_kll.sum()/(B * 10))
-
+        knn_kl = mc_kl_neighbors(curr_logits, curr_mu_pr, curr_std_pr, neigh_logits, neigh_mu_pr, neigh_std_pr)
+        print(0.1 * knn_kl)
         # now compute the kl divergence between current MoG and all 20 MoG
         # print(log_density.shape)
         # print(curr_log_density.shape)
