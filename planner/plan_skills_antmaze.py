@@ -339,11 +339,13 @@ def run_skills_iterative_replanning(env,
     last_eps_std = None
     last_s0_vec = None
     all_s0 = [state_vec[-2:].copy()]
+    reached_goal = False
 
     for repl in range(max_replans):
         cur_xy = state_vec[-2:].copy()
         # stop if already at goal
         if np.sum((state_vec[-2:] - goal_xy) ** 2) < goal_thresh2:
+            reached_goal = True
             print("Reached goal (before planning).")
             break
 
@@ -359,7 +361,7 @@ def run_skills_iterative_replanning(env,
             eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
             eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
         else:
-            if last_eps_mean:
+            if last_eps_mean is not None:
                 eps_mean = last_eps_mean
                 eps_std = last_eps_std
             else:
@@ -381,7 +383,7 @@ def run_skills_iterative_replanning(env,
         # call run_skill_seq
         eps_exec = eps_mean[:execute_n_skills]  # (execute_n_skills, Z)
 
-        state_vec, executed_xy, done, per_skill_exec_xy = run_skill_seq(env,state_vec,eps_exec,prior_type,use_epsilon=use_epsilon,H=H,goal_xy=goal_xy,goal_thresh2=goal_thresh2,deterministic=deterministic,executed_xy=executed_xy)
+        state_vec, executed_xy, done, per_skill_exec_xy, reached_goal = run_skill_seq(env,state_vec,eps_exec,prior_type,use_epsilon=use_epsilon,H=H,goal_xy=goal_xy,goal_thresh2=goal_thresh2,deterministic=deterministic,executed_xy=executed_xy)
 
         executed_skill_xy = per_skill_exec_xy[0]
 
@@ -398,7 +400,7 @@ def run_skills_iterative_replanning(env,
             break
 
     save_final_trajectory(os.path.join(OUTDIR, f"final_executed_trajectory.png"), executed_xy, goal_xy, all_s0)
-    return np.stack(executed_xy, axis=0), goal_xy, last_s0_vec, last_eps_mean, first_state_vec, first_eps_mean, all_s0
+    return np.stack(executed_xy, axis=0), goal_xy, last_s0_vec, last_eps_mean, first_state_vec, first_eps_mean, all_s0, reached_goal
 
 
 def run_skill_seq(env, state_vec, eps_seq, prior_type, use_epsilon=True, H=40,
@@ -440,13 +442,13 @@ def run_skill_seq(env, state_vec, eps_seq, prior_type, use_epsilon=True, H=40,
             if goal_xy is not None:
                 if np.sum((state_vec[-2:] - goal_xy) ** 2) < goal_thresh2:
                     per_skill_exec_xy.append(np.asarray(skill_xy, dtype=np.float32))
-                    return state_vec, executed_xy, True, per_skill_exec_xy
+                    return state_vec, executed_xy, True, per_skill_exec_xy, True
 
             if done:
                 per_skill_exec_xy.append(np.asarray(skill_xy, dtype=np.float32))
-                return state_vec, executed_xy, True, per_skill_exec_xy
+                return state_vec, executed_xy, True, per_skill_exec_xy, False
         per_skill_exec_xy.append(np.asarray(skill_xy, np.float32))
-    return state_vec, executed_xy, False, per_skill_exec_xy
+    return state_vec, executed_xy, False, per_skill_exec_xy, False
 
 
 
@@ -629,8 +631,15 @@ def save_final_trajectory(outpath, executed_xy, goal_xy, all_s0):
     plt.close(fig)
     print(f"saved -> {outpath}")
 
+num_successes = 0
+num_trials = 500
+for i in range(num_trials):
+    exec_xy, goal_xy, last_s0_vec, last_eps_mean, first_s0_vec, first_eps_mean, all_s0,reached_goal = run_skills_iterative_replanning(env,skill_seq_len=skill_seq_len,H=H,execute_n_skills=1,max_replans=max_replans,use_epsilon=True,goal_thresh2=1.0,deterministic=False)
+    if reached_goal:
+        num_successes += 1
+success_rate = num_successes / num_trials
 
-exec_xy, goal_xy, last_s0_vec, last_eps_mean, first_s0_vec, first_eps_mean, all_s0 = run_skills_iterative_replanning(env,skill_seq_len=skill_seq_len,H=H,execute_n_skills=1,max_replans=max_replans,use_epsilon=True,goal_thresh2=1.0,deterministic=False)
+print(f"Success Rate = {success_rate}")
 
 env.close()
 
