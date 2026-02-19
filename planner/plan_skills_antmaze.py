@@ -7,6 +7,7 @@ from model.skill_model import SkillPolicy, SkillPosterior, SkillPrior, TAWM, MoG
 from model.utils import load_checkpoint, pack_state_from_obs, read_antmaze_obs
 from utils import obs_to_state_vec, xy_from_state
 import numpy as np
+import random
 import torch
 import gymnasium as gym
 from gymnasium.wrappers import TimeLimit
@@ -65,7 +66,7 @@ var_pen = 0.0
 render = False
 variable_length = False
 # max_replans = 2000 // H # run max 2000 timesteps
-max_replans = 40000 // H
+max_replans = 2000 // H
 plan_length_cost = 0.0
 encoder_type = 'state_action_sequence'
 term_state_dependent_prior = False
@@ -74,12 +75,12 @@ random_goal = False # determines if we select a goal at random from dataset (ran
 
 # filename = 'antmaze_diverse_detached_250_1.pth'
 # filename = 'kl_balancing/antmaze_diverse_detached_klbalance_epoch75_beta1.0_gamma0.001.pth'
-filename = 'kl_balancing_MoG/beta_gamma/antmaze_diverse_detached_klbalance_mog_50_beta0.001_gamma1.pth'
-
+# filename = 'kl_balancing_MoG_knn/antmaze_diverse_detached_klbalance_mog_knn_epoch100_beta0.001_gamma1-lambda0.1.pth'
+filename = 'kl_balancing_MoG/beta_gamma/antmaze_diverse_detached_klbalance_mog_epoch100_beta0.001_gamma1-filtered.pth'
 PATH = '../checkpoints/' + filename
 
 OUTDIR = "planning"
-PLANS_DIR = os.path.join(OUTDIR, "plans_per_replan4")
+PLANS_DIR = os.path.join(OUTDIR, "plans_per_replan15")
 os.makedirs(PLANS_DIR, exist_ok=True)
 
 skillpost = SkillPosterior(state_dim=state_dim, action_dim=a_dim).to(device)
@@ -156,10 +157,10 @@ def build_antmaze_background(minari_dataset, bins=300, stride=1):
 
 @torch.no_grad()
 def mog_mean_std(skillprior, s):
-    "Review"
+    "Samples one of the K Gaussians for each batch element and samples "
     logits, mean, std = skillprior(s)          
     k = torch.distributions.Categorical(logits=logits).sample()                 
-    # gather along the mixture dimension (-2)
+    # gather the mean and std of the corresponding kth gaussian
     idx = k.unsqueeze(-1).unsqueeze(-1).expand(*mean.shape[:-2], 1, mean.shape[-1]) 
     mu_k  = mean.gather(dim=-2, index=idx).squeeze(-2)   
     std_k = std.gather(dim=-2, index=idx).squeeze(-2)    
@@ -283,10 +284,8 @@ def get_expected_cost_for_cem(s0, eps_seq, goal_xy, prior_type, length_cost=0.0)
     """
     Returns the cost of the eps_seq which is the minimum distance along the whole skill sequence to the goal.
 
-    s0: [B,1,sd] 
-    eps_seq: [B,L,Z] 
-    goal_xy: [2] 
-    returns: [B] costs or best cost [1]
+    s0: [B,1,sd] ,eps_seq: [B,L,Z] ,goal_xy: [2] 
+    returns: [B] costs
     """
     s = s0.squeeze(1) # [B, D]
 
@@ -308,11 +307,12 @@ def get_expected_cost_for_cem(s0, eps_seq, goal_xy, prior_type, length_cost=0.0)
         z_i = mu_z + sigma_z * eps_i           
 
         s, _ = tawm(s, z_i)                   
-        costs.append(((s[:, -2:] - goal_xy) ** 2).mean(dim=-1) + (i+1)*length_cost)
+        costs.append(((s[:, -2:] - goal_xy) ** 2).mean(dim=-1) + (i+1)*length_cost) # sequences are preferred when they are closer to the goal earlier on in the sequence
         pred_states.append(s)
 
     costs = torch.stack(costs, dim=1) # [B,L+1]
     best, _ = torch.min(costs, dim=1)  # [B]
+    # return costs[:, -1]
     return best
 
 def run_skills_iterative_replanning(env,
@@ -336,6 +336,7 @@ def run_skills_iterative_replanning(env,
 
     first_eps_mean = None
     last_eps_mean = None
+    last_eps_std = None
     last_s0_vec = None
     all_s0 = [state_vec[-2:].copy()]
 
@@ -354,15 +355,27 @@ def run_skills_iterative_replanning(env,
 
         cost_fn = lambda eps_seq: get_expected_cost_for_cem(s_batch, eps_seq, goal_xy_t, prior_type, length_cost=plan_length_cost)
 
-        eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
-        eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
+        if random.random() < 0.5:
+            eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
+            eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
+        else:
+            if last_eps_mean:
+                eps_mean = last_eps_mean
+                eps_std = last_eps_std
+            else:
+                eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
+                eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
+                 
+                 
 
         eps_mean, eps_std = cem(eps_mean, eps_std, cost_fn,pop_size=batch_size, frac_keep=keep_frac, n_iters=n_iters,l2_pen=cem_l2_pen)
         if first_eps_mean == None:
              first_eps_mean = eps_mean
 
         last_eps_mean = eps_mean.detach().clone()
+        last_eps_std = eps_std.detach().clone()
 
+        # starting from this state, tawm dist for following 10 skills
         plan_means_xy, plan_stds_xy = tawm_plan_xy(state_vec, eps_mean, prior_type, n_std = 1)
 
         # call run_skill_seq
