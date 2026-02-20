@@ -353,9 +353,11 @@ def compute_loss_klbalancing_mog_knn(batch, beta, gamma):
     denom = B * T
     s0_xy = s0[:, -2:]
 
+    # select neighbors by simply by sampling close neighbors
     indices = pick_nearby_ep(train_episodes_start_xy, s0_xy)
     neighbor_s0 = train_episodes_start[indices]
 
+    # create MoG dist for curr s0 and neighboring s0
     curr_logits, curr_mu_pr, curr_std_pr = p_omega(s0)
     B, n_neighbors, state_dim = neighbor_s0.shape
     neigh_logits, neigh_mu_pr, neigh_std_pr = p_omega(neighbor_s0.reshape(B * n_neighbors, 29))
@@ -366,13 +368,12 @@ def compute_loss_klbalancing_mog_knn(batch, beta, gamma):
     neigh_mu_pr = neigh_mu_pr.reshape(B, n_neighbors, K, z_dim)
     neigh_std_pr = neigh_std_pr.reshape(B, n_neighbors, K, z_dim)
 
+    # KL btw MoG is intractable, find by samplign w/ MC
     knn_kl = mc_kl_neighbors(curr_logits, curr_mu_pr, curr_std_pr, neigh_logits, neigh_mu_pr, neigh_std_pr)
 
     # State encoder
     mu_q, std_q = q_phi(S, A)                      
     z = mu_q + std_q * torch.randn_like(mu_q)
-
-    indices = pick_nearby_ep(train_episodes_start_xy, s0_xy)
 
     # Low-level policy pi_theta(a|s,z)
     z_bt = z.unsqueeze(1).expand(B, T, -1)         
@@ -424,7 +425,7 @@ def eval_epoch(val_loader, q_phi, pi_theta, p_psi, p_omega, beta, gamma, device)
     loss_sum,policy_loss_sum, kl_loss_sum, state_decoder_loss_sum, n = 0.0, 0.0, 0.0, 0.0, 0
     for batch in val_loader:
         batch = {k: v.to(device) for k, v in batch.items()}
-        terms = compute_loss_klbalancing_mog(batch, beta, gamma)
+        terms = compute_loss_klbalancing_mog_knn(batch, beta, gamma)
         loss = terms["loss"]
         policy_loss = terms["policy_loss"]
         kl_loss = terms["kl_loss"]
