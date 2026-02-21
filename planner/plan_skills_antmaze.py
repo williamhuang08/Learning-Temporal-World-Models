@@ -67,7 +67,7 @@ render = False
 variable_length = False
 # max_replans = 2000 // H # run max 2000 timesteps
 max_replans = 2000 // H
-plan_length_cost = 0.0
+plan_length_cost = 1.0
 encoder_type = 'state_action_sequence'
 term_state_dependent_prior = False
 init_state_dependent = True
@@ -76,11 +76,13 @@ random_goal = False # determines if we select a goal at random from dataset (ran
 # filename = 'antmaze_diverse_detached_250_1.pth'
 # filename = 'kl_balancing/antmaze_diverse_detached_klbalance_epoch75_beta1.0_gamma0.001.pth'
 # filename = 'kl_balancing_MoG_knn/antmaze_diverse_detached_klbalance_mog_knn_epoch100_beta0.001_gamma1-lambda0.1.pth'
-filename = 'kl_balancing_MoG/beta_gamma/antmaze_diverse_detached_klbalance_mog_epoch100_beta0.001_gamma1-filtered.pth'
+filename = 'kl_balancing_MoG/beta_gamma/antmaze_diverse_detached_klbalance_mog_epoch100_beta0.001_gamma1-unfiltered.pth'
+# filename = 'kl_balancing_MoG/beta_gamma/antmaze_diverse_detached_klbalance_mog_epoch2000_beta0.001_gamma1-filtered.pth'
+
 PATH = '../checkpoints/' + filename
 
 OUTDIR = "planning"
-PLANS_DIR = os.path.join(OUTDIR, "plans_per_replan15")
+PLANS_DIR = os.path.join(OUTDIR, "plans_per_replan16")
 os.makedirs(PLANS_DIR, exist_ok=True)
 
 skillpost = SkillPosterior(state_dim=state_dim, action_dim=a_dim).to(device)
@@ -159,12 +161,17 @@ def build_antmaze_background(minari_dataset, bins=300, stride=1):
 def mog_mean_std(skillprior, s):
     "Samples one of the K Gaussians for each batch element and samples "
     logits, mean, std = skillprior(s)          
-    k = torch.distributions.Categorical(logits=logits).sample()                 
-    # gather the mean and std of the corresponding kth gaussian
-    idx = k.unsqueeze(-1).unsqueeze(-1).expand(*mean.shape[:-2], 1, mean.shape[-1]) 
-    mu_k  = mean.gather(dim=-2, index=idx).squeeze(-2)   
-    std_k = std.gather(dim=-2, index=idx).squeeze(-2)    
-    return mu_k, std_k
+    # k = torch.distributions.Categorical(logits=logits).sample()                 
+    # # gather the mean and std of the corresponding kth gaussian
+    # idx = k.unsqueeze(-1).unsqueeze(-1).expand(*mean.shape[:-2], 1, mean.shape[-1]) 
+    # mu_k  = mean.gather(dim=-2, index=idx).squeeze(-2)   
+    # std_k = std.gather(dim=-2, index=idx).squeeze(-2)    
+    # return mu_k, std_k
+    k = torch.argmax(logits, dim=-1)
+    idx = k[..., None, None].expand(*mean.shape[:-2], 1, mean.shape[-1])
+    mu = mean.gather(-2, idx).squeeze(-2)
+    sig = std.gather(-2, idx).squeeze(-2)
+    return mu, sig
 
 
 @torch.no_grad()
@@ -357,17 +364,23 @@ def run_skills_iterative_replanning(env,
 
         cost_fn = lambda eps_seq: get_expected_cost_for_cem(s_batch, eps_seq, goal_xy_t, prior_type, length_cost=plan_length_cost)
 
-        if random.random() < 0.5:
+        # if random.random() < 0.5:
+        #     eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
+        #     eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
+        # else:
+        #     if last_eps_mean is not None:
+        #         eps_mean = last_eps_mean
+        #         eps_std = last_eps_std
+        #     else:
+        #         eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
+        #         eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
+        if last_eps_mean is None:
             eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
             eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
         else:
-            if last_eps_mean is not None:
-                eps_mean = last_eps_mean
-                eps_std = last_eps_std
-            else:
-                eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
-                eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
-                 
+            eps_mean = torch.cat([last_eps_mean[1:], torch.zeros(1, z_dim, device=device)], dim=0)
+            eps_std  = torch.cat([last_eps_std[1:],  torch.ones(1, z_dim, device=device)], dim=0)
+             
                  
 
         eps_mean, eps_std = cem(eps_mean, eps_std, cost_fn,pop_size=batch_size, frac_keep=keep_frac, n_iters=n_iters,l2_pen=cem_l2_pen)
