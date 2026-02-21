@@ -35,8 +35,8 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # gamma = 0.01
 # betas = np.geomspace(0.001, 1, num=4) 
 # gammas = np.geomspace(0.001, 1, num=4)
-betas = np.array([0.001])
-gammas = np.array([1])
+betas = np.array([0.01]) # increased value of beta term may be beneficial when prior is more expressive or else posterior begins running away from prior
+gammas = np.array([0.1])
 
 # According to the paper, each layer contains 256 neurons
 NUM_NEURONS = 256
