@@ -3,9 +3,6 @@
 import minari
 import os
 import sys
-from model.skill_model import SkillPolicy, SkillPosterior, SkillPrior, TAWM, MoGSkillPrior
-from model.utils import load_checkpoint, pack_state_from_obs, read_antmaze_obs
-from utils import obs_to_state_vec, xy_from_state
 import numpy as np
 import random
 import torch
@@ -16,7 +13,12 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
-from cem import cem, cem_variable_length
+
+from cem import cem
+from model.skill_model import SkillPolicy, SkillPosterior, SkillPrior, TAWM, MoGSkillPrior
+from model.utils import load_checkpoint
+from model.dataloader import SubtrajDataset, collate
+from utils import obs_to_state_vec, xy_from_state
 
 sys.path.append(os.path.abspath(".."))
 from utils import SubtrajDataset, make_episode_splits, collate
@@ -190,7 +192,7 @@ def policy_action(llpolicy, state_vec, z_vec, deterministic=True):
         std = std.clamp_min(0.05)
         a = mu + std * torch.randn_like(mu)
 
-    a = torch.tanh(a)
+    # a = torch.tanh(a)
     return a.squeeze(0).cpu().numpy()
 
 def convert_epsilon_to_z(epsilon, s0_vec, prior_type):
@@ -374,15 +376,14 @@ def run_skills_iterative_replanning(env,
         #     else:
         #         eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
         #         eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
-        if last_eps_mean is None:
-            eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
-            eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
-        else:
-            eps_mean = torch.cat([last_eps_mean[1:], torch.zeros(1, z_dim, device=device)], dim=0)
-            eps_std  = torch.cat([last_eps_std[1:],  torch.ones(1, z_dim, device=device)], dim=0)
-             
-                 
-
+        # if last_eps_mean is None:
+        #     eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
+        #     eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
+        # else:
+        #     eps_mean = torch.cat([last_eps_mean[1:], torch.zeros(1, z_dim, device=device)], dim=0)
+        #     eps_std  = torch.cat([last_eps_std[1:],  torch.ones(1, z_dim, device=device)], dim=0)
+        eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
+        eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
         eps_mean, eps_std = cem(eps_mean, eps_std, cost_fn,pop_size=batch_size, frac_keep=keep_frac, n_iters=n_iters,l2_pen=cem_l2_pen)
         if first_eps_mean == None:
              first_eps_mean = eps_mean
@@ -647,7 +648,7 @@ def save_final_trajectory(outpath, executed_xy, goal_xy, all_s0):
 num_successes = 0
 num_trials = 500
 for i in range(num_trials):
-    exec_xy, goal_xy, last_s0_vec, last_eps_mean, first_s0_vec, first_eps_mean, all_s0,reached_goal = run_skills_iterative_replanning(env,skill_seq_len=skill_seq_len,H=H,execute_n_skills=1,max_replans=max_replans,use_epsilon=True,goal_thresh2=1.0,deterministic=False)
+    exec_xy, goal_xy, last_s0_vec, last_eps_mean, first_s0_vec, first_eps_mean, all_s0,reached_goal = run_skills_iterative_replanning(env,skill_seq_len=skill_seq_len,H=H,execute_n_skills=1,max_replans=max_replans,use_epsilon=True,goal_thresh2=1.0,deterministic=True)
     if reached_goal:
         num_successes += 1
 success_rate = num_successes / num_trials
