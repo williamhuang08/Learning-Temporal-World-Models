@@ -2,7 +2,6 @@ import os
 import torch
 import numpy as np
 
-
 # Load and save the model to a .pth file
 def save_checkpoint(path, q_phi, pi_theta, p_psi, p_omega, B, T, Z_DIM, NUM_NEURONS, device):
     ckpt = {
@@ -19,6 +18,7 @@ def save_checkpoint(path, q_phi, pi_theta, p_psi, p_omega, B, T, Z_DIM, NUM_NEUR
 
 def load_checkpoint(path, q_phi, pi_theta, p_psi, p_omega, strict=True):
     ckpt = torch.load(path, weights_only=False, map_location=torch.device('cpu'))
+    # ckpt = torch.load(path)
     q_phi.load_state_dict(ckpt["q_phi"], strict=strict)
     pi_theta.load_state_dict(ckpt["pi_theta"], strict=strict)
     p_psi.load_state_dict(ckpt["p_psi"], strict=strict)
@@ -39,6 +39,7 @@ def pack_state_from_obs(obs):
 
     state = np.concatenate([obs_vec.astype(np.float32), ag.astype(np.float32)], 0) # Combines the 27-d and 2-d tensors
     return obs_vec.astype(np.float32), ag.astype(np.float32), state
+
 
 def read_antmaze_obs(env):
     """Reconstruct AntMaze dict-observation from MuJoCo state."""
