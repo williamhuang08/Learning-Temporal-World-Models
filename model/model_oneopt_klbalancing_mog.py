@@ -80,7 +80,7 @@ class SubtrajDataset(Dataset):
     """
     Loops over minari_dataset.iterate_episodes(), but keeps only episodes whose index is in episode_ids
     """
-    def __init__(self, minari_dataset, T, episode_ids, stride=3):
+    def __init__(self, minari_dataset, T, episode_ids, stride=1):
         self.T = T
         self.items = [] 
         self.removed_items = [] 
@@ -101,11 +101,16 @@ class SubtrajDataset(Dataset):
                 state_seq = state_ext[t:t+T]         
                 s0 = state_seq[0]             
                 action_seq = act[t:t+T].astype(np.float32)  
-                sT = state_ext[t+T]           
-                if np.linalg.norm(s0[-2:] - sT[-2:]) > 0.4:
-                    self.items.append((s0, state_seq, action_seq, sT))
-                else:
+                sT = state_seq[-1]
+
+                state_seq_xy = state_seq[:, -2:]
+                dxy = state_seq_xy[1:] - state_seq_xy[:-1] # rows 1 -> T-1 - rows 0 -> T - 2
+                step_size = np.linalg.norm(dxy, axis=-1)
+                fine = np.all(step_size <= 0.5)
+                if not fine:
                     self.removed_items.append((s0, state_seq, action_seq, sT))
+                else:
+                    self.items.append((s0, state_seq, action_seq, sT))
 
     def __len__(self): 
         return len(self.items)
@@ -126,7 +131,7 @@ class SubtrajDataset(Dataset):
             "action_sequence": torch.as_tensor(A, dtype=torch.float32),
             "sT": torch.as_tensor(sT, dtype=torch.float32),
         }
-
+    
 def collate(batch):
     return {
         "s0": torch.stack([b["s0"] for b in batch], 0),
@@ -137,13 +142,13 @@ def collate(batch):
 
 
 # Pick indices for train/test/split
-train_ids, val_ids, test_ids = make_episode_splits(ant_maze_dataset, train=0.8, val=0.0, test=0.2, seed=0)
+train_ids, val_ids, test_ids = make_episode_splits(ant_maze_dataset, train=0.8, val=0.1, test=0.1, seed=0)
 print(f"train:{len(train_ids)}  val:{len(val_ids)}  test:{len(test_ids)}")
 
 # Datasets from episode subsets
-train_ds = SubtrajDataset(ant_maze_dataset, T=T, episode_ids=train_ids, stride=3)
-val_ds = SubtrajDataset(ant_maze_dataset, T=T, episode_ids=val_ids,   stride=3)
-test_ds = SubtrajDataset(ant_maze_dataset, T=T, episode_ids=test_ids,  stride=3)  
+train_ds = SubtrajDataset(ant_maze_dataset, T=T, episode_ids=train_ids, stride=1)
+val_ds = SubtrajDataset(ant_maze_dataset, T=T, episode_ids=val_ids,   stride=1)
+test_ds = SubtrajDataset(ant_maze_dataset, T=T, episode_ids=test_ids,  stride=1)  
 
 print(f"train:{len(train_ds)}  val:{len(val_ds)}  test:{len(test_ds)}")
 
@@ -491,7 +496,7 @@ for beta in betas:
 
         wandb.watch([q_phi, pi_theta, p_psi, p_omega], log="gradients", log_freq=200)
 
-        curves = skill_model_training_with_val(train_loader, test_loader, q_phi, pi_theta, p_psi, p_omega, beta, gamma, epochs=epochs, lr=lr, steps=1)
+        curves = skill_model_training_with_val(train_loader, val_loader, q_phi, pi_theta, p_psi, p_omega, beta, gamma, epochs=epochs, lr=lr, steps=1)
 
         wandb.finish()
 
