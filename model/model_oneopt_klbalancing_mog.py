@@ -323,13 +323,13 @@ def skill_model_training_with_val(
 
         tr.append(loss_epoch)
         if epoch % 50 == 0:
-            save_checkpoint(f"{save_path}/epochs/mog_epoch{epoch}_beta{beta}_gamma{gamma}.pth", q_phi, pi_theta, p_psi, p_omega, Z_DIM, NUM_NEURONS, device)
+            save_checkpoint(f"{save_path}/epochs/mog_epoch{epoch}_beta{beta}_gamma{gamma}.pth", q_phi, pi_theta, p_psi, p_omega, B, T, Z_DIM, NUM_NEURONS, device)
 
         # validation
         v_loss, v_policy_loss, v_kl_loss, v_state_decoder_loss = eval_epoch(val_loader, q_phi, pi_theta, p_psi, p_omega, beta, gamma, device)
         if v_loss < best_val_loss:
             best_val_loss = v_loss
-            save_checkpoint(f"{save_path}/mog_epoch{epoch}_beta{beta}_gamma{gamma}_best.pth", q_phi, pi_theta, p_psi, p_omega, Z_DIM, NUM_NEURONS, device)
+            save_checkpoint(f"{save_path}/mog_epoch{epoch}_beta{beta}_gamma{gamma}_best.pth", q_phi, pi_theta, p_psi, p_omega, B, T, Z_DIM, NUM_NEURONS, device)
 
         va.append(v_loss)
 
@@ -391,8 +391,8 @@ for beta in betas:
 
         wandb.watch([q_phi, pi_theta, p_psi, p_omega], log="gradients", log_freq=200)
         save_path = f"checkpoints/{beta}_{gamma}"
-        os.makedirs(os.path.join((save_path, )))
-        curves = skill_model_training_with_val(train_loader, val_loader, q_phi, pi_theta, p_psi, p_omega, beta, gamma, epochs=epochs, lr=lr, steps=1)
+        os.makedirs(os.path.join(save_path, "epoch"), exist_ok=True)
+        curves = skill_model_training_with_val(save_path, train_loader, val_loader, q_phi, pi_theta, p_psi, p_omega, beta, gamma, epochs=epochs, lr=lr, steps=1)
 
         wandb.finish()
 
