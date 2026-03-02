@@ -20,7 +20,7 @@ import os
 import argparse
 
 from skill_model import SkillPolicy, SkillPosterior, SkillPrior, TAWM, MoGSkillPrior
-from dataloader import SubtrajDataset, collate
+from dataloader import SubtrajDataset, collate, make_episode_splits
 from utils import save_checkpoint, load_checkpoint
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -62,21 +62,6 @@ T = 40
 # AntMaze state and action dims (from Minari)
 state_dim = 29
 action_dim = 8
-
-def make_episode_splits(minari_dataset, train=0.8, val=0.1, test=0.1, seed=0):
-    """Return three lists of episode indices (train_ids, val_ids, test_ids)."""
-    # Materialize all episodes once so we know how many there are
-    episodes = list(minari_dataset.iterate_episodes())
-    n = len(episodes)
-    idxs = list(range(n))
-    # Shuffle the indices
-    random.Random(seed).shuffle(idxs)
-    n_train = int(round(train * n))
-    n_val = int(round(val * n))
-    train_ids = idxs[:n_train]
-    val_ids = idxs[n_train:n_train+n_val]
-    test_ids = idxs[n_train+n_val:]
-    return train_ids, val_ids, test_ids
 
 # Pick indices for train/test/split
 train_ids, val_ids, test_ids = make_episode_splits(ant_maze_dataset, train=0.8, val=0.1, test=0.1, seed=0)
@@ -282,10 +267,11 @@ def eval_epoch(val_loader, q_phi, pi_theta, p_psi, p_omega, beta, gamma, device)
     return loss_sum / n, policy_loss_sum / n, kl_loss_sum / n, state_decoder_loss_sum / n
 
 def skill_model_training_with_val(
-    train_loader, val_loader,
+    save_path, # checkpoints/beta_gamma/
+    train_loader, val_loader, 
     q_phi, pi_theta, p_psi, p_omega, beta, gamma,
     lr=5e-5,
-    epochs=50, steps=1, grad_clip=1.0
+    epochs=50, steps=1, grad_clip=1.0, 
 ):
     q_phi.to(device)
     pi_theta.to(device)
@@ -295,6 +281,8 @@ def skill_model_training_with_val(
     opt = torch.optim.Adam(list(q_phi.parameters()) + list(pi_theta.parameters()) + list(p_psi.parameters()) + list(p_omega.parameters()), lr=lr)
 
     tr, va = [], []
+
+    best_val_loss = float("inf")
 
     for epoch in range(1, epochs+1):
         q_phi.train()
@@ -334,9 +322,15 @@ def skill_model_training_with_val(
         state_decoder_loss_epoch = state_decoder_loss_run / max(1, nb)
 
         tr.append(loss_epoch)
+        if epoch % 50 == 0:
+            save_checkpoint(f"{save_path}/epochs/mog_epoch{epoch}_beta{beta}_gamma{gamma}.pth", q_phi, pi_theta, p_psi, p_omega, Z_DIM, NUM_NEURONS, device)
 
         # validation
         v_loss, v_policy_loss, v_kl_loss, v_state_decoder_loss = eval_epoch(val_loader, q_phi, pi_theta, p_psi, p_omega, beta, gamma, device)
+        if v_loss < best_val_loss:
+            best_val_loss = v_loss
+            save_checkpoint(f"{save_path}/mog_epoch{epoch}_beta{beta}_gamma{gamma}_best.pth", q_phi, pi_theta, p_psi, p_omega, Z_DIM, NUM_NEURONS, device)
+
         va.append(v_loss)
 
         print(f"[Epoch {epoch:03d}/{epochs}] "
@@ -372,7 +366,7 @@ def skill_model_training_with_val(
 
     return {"train_loss": tr, "val_E": va}
 
-epochs = 200
+epochs = 50000
 lr=5e-5
 
 for beta in betas:
@@ -396,12 +390,11 @@ for beta in betas:
         )
 
         wandb.watch([q_phi, pi_theta, p_psi, p_omega], log="gradients", log_freq=200)
-
+        save_path = f"checkpoints/{beta}_{gamma}"
+        os.makedirs(os.path.join((save_path, )))
         curves = skill_model_training_with_val(train_loader, val_loader, q_phi, pi_theta, p_psi, p_omega, beta, gamma, epochs=epochs, lr=lr, steps=1)
 
         wandb.finish()
-
-        save_checkpoint(f"checkpoints/antmaze_diverse_detached_klbalance_mog_50_beta{beta}_gamma{gamma}.pth", q_phi, pi_theta, p_psi, p_omega, Z_DIM, NUM_NEURONS, device)
 
 
 
