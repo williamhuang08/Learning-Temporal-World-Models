@@ -241,6 +241,45 @@ def compute_loss_klbalancing_mog(batch, beta, gamma):
         "state_decoder_loss": sT_loss
     }
 
+def compute_test_loss(batch, beta, gamma):
+    s0, S, A, sT = batch["s0"], batch["state_sequence"], batch["action_sequence"], batch["sT"]
+    B, T, _  = S.shape
+    denom = B * T
+
+    # State encoder
+    mu_q, std_q = q_phi(S, A)                      
+    z = mu_q + std_q * torch.randn_like(mu_q)
+
+    # Low-level policy pi_theta(a|s,z)
+    z_bt = z.unsqueeze(1).expand(B, T, -1)         
+    mu_pi, std_pi = pi_theta(S.reshape(B*T, -1), z_bt.reshape(B*T, -1))
+    mu_pi, std_pi = mu_pi.view(B, T, -1), std_pi.view(B, T, -1)
+    a_dist  = Independent(Normal(mu_pi, std_pi), 1)        
+
+    # Compute policy loss
+    a_loss  = -a_dist.log_prob(A).sum() / denom
+
+    log_prior = p_omega.log_prob(z, s0).sum() / denom
+    post_dist = Independent(Normal(mu_q,  std_q),  1)
+    log_post  = post_dist.log_prob(z).sum() / denom
+
+    kl_loss = -log_prior + log_post
+    # TAWM over terminal state
+    mu_T, std_T = p_psi(s0, z)                            
+    sT_dist = Independent(Normal(mu_T, std_T), 1)
+
+    # State decoder loss
+    sT_loss = -sT_dist.log_prob(sT).sum() / denom
+
+    # Overall loss (naive VI loss from paper)
+    loss = alpha * sT_loss + a_loss +  beta * kl_loss
+    return {
+        "loss": loss,
+        "policy_loss": a_loss,
+        "kl_loss": kl_loss,
+        "state_decoder_loss": sT_loss
+    }
+
 @torch.no_grad()
 def eval_epoch(val_loader, q_phi, pi_theta, p_psi, p_omega, beta, gamma, device):
     """Compute validation loss"""
@@ -251,7 +290,7 @@ def eval_epoch(val_loader, q_phi, pi_theta, p_psi, p_omega, beta, gamma, device)
     loss_sum,policy_loss_sum, kl_loss_sum, state_decoder_loss_sum, n = 0.0, 0.0, 0.0, 0.0, 0
     for batch in val_loader:
         batch = {k: v.to(device) for k, v in batch.items()}
-        terms = compute_loss_klbalancing_mog(batch, beta, gamma)
+        terms = compute_test_loss(batch, beta, gamma)
         loss = terms["loss"]
         policy_loss = terms["policy_loss"]
         kl_loss = terms["kl_loss"]
@@ -391,7 +430,7 @@ for beta in betas:
 
         wandb.watch([q_phi, pi_theta, p_psi, p_omega], log="gradients", log_freq=200)
         save_path = f"checkpoints/{beta}_{gamma}"
-        os.makedirs(os.path.join(save_path, "epoch"), exist_ok=True)
+        os.makedirs(os.path.join(save_path, "epochs"), exist_ok=True)
         curves = skill_model_training_with_val(save_path, train_loader, val_loader, q_phi, pi_theta, p_psi, p_omega, beta, gamma, epochs=epochs, lr=lr, steps=1)
 
         wandb.finish()
