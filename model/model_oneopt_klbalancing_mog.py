@@ -195,45 +195,40 @@ def compute_loss_klbalancing(batch, beta, gamma):
 
 def compute_loss_klbalancing_mog(batch, beta, gamma):
     s0, S, A, sT = batch["s0"], batch["state_sequence"], batch["action_sequence"], batch["sT"]
-    B, T, _  = S.shape
-    denom = B * T
+    B, T, _ = S.shape
 
-    # State encoder
-    mu_q, std_q = q_phi(S, A)                      
+    # posterior q(z | S, A)
+    mu_q, std_q = q_phi(S, A)
     z = mu_q + std_q * torch.randn_like(mu_q)
 
-    # Low-level policy pi_theta(a|s,z)
-    z_bt = z.unsqueeze(1).expand(B, T, -1)         
+    # policy p(a_t | s_t, z)
+    z_bt = z.unsqueeze(1).expand(B, T, -1)
     mu_pi, std_pi = pi_theta(S.reshape(B*T, -1), z_bt.reshape(B*T, -1))
-    mu_pi, std_pi = mu_pi.view(B, T, -1), std_pi.view(B, T, -1)
-    a_dist  = Independent(Normal(mu_pi, std_pi), 1)        
+    mu_pi = mu_pi.view(B, T, -1)
+    std_pi = std_pi.view(B, T, -1)
 
-    # Compute policy loss
-    a_loss  = -a_dist.log_prob(A).sum() / denom
+    a_dist = Normal(mu_pi, std_pi)
+    a_loss = -torch.mean(torch.sum(a_dist.log_prob(A), dim=-1))
 
-    log_prior = p_omega.log_prob(z, s0).sum() / denom
-    post_dist = Independent(Normal(mu_q,  std_q),  1)
-    log_post  = post_dist.log_prob(z).sum() / denom
+    # posterior and prior log probs
+    post_dist = Normal(mu_q, std_q)
+    log_post = torch.mean(torch.sum(post_dist.log_prob(z), dim=-1)) / T  
+    log_prior = torch.mean(p_omega.log_prob(z, s0)) / T                  
 
-    kl_post = (log_post - log_prior.detach()) # post to match prior
+    kl_post = log_post - log_prior.detach()
 
-    # Detach gradient
     z_detached = z.detach()
+    log_prior_det = torch.mean(p_omega.log_prob(z_detached, s0)) / T
+    kl_prior = log_post.detach() - log_prior_det
 
-    # w/ KL balancing
-    log_prior_det = p_omega.log_prob(z_detached, s0).sum() / denom
-    kl_prior = (log_post.detach() - log_prior_det) # prior to match post
     kl_loss = beta * kl_post + gamma * kl_prior
 
-    # TAWM over terminal state
-    mu_T, std_T = p_psi(s0, z_detached)                            
-    sT_dist = Independent(Normal(mu_T, std_T), 1)
+    # terminal-state decoder
+    mu_T, std_T = p_psi(s0, z_detached)
+    sT_dist = Normal(mu_T, std_T)
+    sT_loss = -torch.mean(torch.sum(sT_dist.log_prob(sT), dim=-1)) / T
 
-    # State decoder loss
-    sT_loss = -sT_dist.log_prob(sT).sum() / denom
-
-    # Overall loss (naive VI loss from paper)
-    loss = alpha * sT_loss + a_loss +  kl_loss
+    loss = alpha * sT_loss + a_loss + kl_loss
     return {
         "loss": loss,
         "policy_loss": a_loss,
@@ -241,38 +236,32 @@ def compute_loss_klbalancing_mog(batch, beta, gamma):
         "state_decoder_loss": sT_loss
     }
 
+
 def compute_test_loss(batch, beta, gamma):
     s0, S, A, sT = batch["s0"], batch["state_sequence"], batch["action_sequence"], batch["sT"]
-    B, T, _  = S.shape
-    denom = B * T
+    B, T, _ = S.shape
 
-    # State encoder
-    mu_q, std_q = q_phi(S, A)                      
+    mu_q, std_q = q_phi(S, A)
     z = mu_q + std_q * torch.randn_like(mu_q)
 
-    # Low-level policy pi_theta(a|s,z)
-    z_bt = z.unsqueeze(1).expand(B, T, -1)         
+    z_bt = z.unsqueeze(1).expand(B, T, -1)
     mu_pi, std_pi = pi_theta(S.reshape(B*T, -1), z_bt.reshape(B*T, -1))
-    mu_pi, std_pi = mu_pi.view(B, T, -1), std_pi.view(B, T, -1)
-    a_dist  = Independent(Normal(mu_pi, std_pi), 1)        
+    mu_pi = mu_pi.view(B, T, -1)
+    std_pi = std_pi.view(B, T, -1)
 
-    # Compute policy loss
-    a_loss  = -a_dist.log_prob(A).sum() / denom
+    a_dist = Normal(mu_pi, std_pi)
+    a_loss = -torch.mean(torch.sum(a_dist.log_prob(A), dim=-1))
 
-    log_prior = p_omega.log_prob(z, s0).sum() / denom
-    post_dist = Independent(Normal(mu_q,  std_q),  1)
-    log_post  = post_dist.log_prob(z).sum() / denom
+    post_dist = Normal(mu_q, std_q)
+    log_post = torch.mean(torch.sum(post_dist.log_prob(z), dim=-1)) / T
+    log_prior = torch.mean(p_omega.log_prob(z, s0)) / T
+    kl_loss = log_post - log_prior
 
-    kl_loss = -log_prior + log_post
-    # TAWM over terminal state
-    mu_T, std_T = p_psi(s0, z)                            
-    sT_dist = Independent(Normal(mu_T, std_T), 1)
+    mu_T, std_T = p_psi(s0, z)
+    sT_dist = Normal(mu_T, std_T)
+    sT_loss = -torch.mean(torch.sum(sT_dist.log_prob(sT), dim=-1)) / T
 
-    # State decoder loss
-    sT_loss = -sT_dist.log_prob(sT).sum() / denom
-
-    # Overall loss (naive VI loss from paper)
-    loss = alpha * sT_loss + a_loss +  beta * kl_loss
+    loss = alpha * sT_loss + a_loss + beta * kl_loss
     return {
         "loss": loss,
         "policy_loss": a_loss,
