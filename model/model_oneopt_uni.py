@@ -172,7 +172,7 @@ def compute_test_loss(batch, beta):
     }
 
 @torch.no_grad()
-def eval_epoch(val_loader, q_phi, pi_theta, p_psi, p_omega, beta, gamma, device):
+def eval_epoch(val_loader, q_phi, pi_theta, p_psi, p_omega, beta, device):
     """Compute validation loss"""
     q_phi.eval()
     pi_theta.eval()
@@ -257,7 +257,7 @@ def skill_model_training_with_val(
             save_checkpoint(f"{save_path}/epochs/uni_epoch{epoch}_beta{beta}.pth", q_phi, pi_theta, p_psi, p_omega, B, T, Z_DIM, NUM_NEURONS, device)
 
         # validation
-        v_loss, v_policy_loss, v_kl_loss, v_state_decoder_loss = eval_epoch(val_loader, q_phi, pi_theta, p_psi, p_omega, beta, gamma, device)
+        v_loss, v_policy_loss, v_kl_loss, v_state_decoder_loss = eval_epoch(val_loader, q_phi, pi_theta, p_psi, p_omega, beta, device)
         if v_loss < best_val_loss:
             best_val_loss = v_loss
             save_checkpoint(f"{save_path}/uni_epoch{epoch}_beta{beta}_best.pth", q_phi, pi_theta, p_psi, p_omega, B, T, Z_DIM, NUM_NEURONS, device)
