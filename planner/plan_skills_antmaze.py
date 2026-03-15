@@ -545,7 +545,7 @@ def run_skills_iterative_replanning(env,
         if done:
             break
 
-    save_final_trajectory(os.path.join(OUTDIR, f"{PLANS_DIR}/final_executed_trajectory.png"), executed_xy, goal_xy, all_s0)
+    save_final_trajectory(os.path.join(PLANS_DIR, "final_executed_trajectory.png"), executed_xy, goal_xy, all_s0)
     return np.stack(executed_xy, axis=0), goal_xy, last_s0_vec, last_eps_mean, first_state_vec, first_eps_mean, all_s0, reached_goal
 
 
@@ -799,7 +799,7 @@ plot_global_bg(all_xy)
 num_successes = 0
 num_trials = 500
 for i in range(num_trials):
-    PLANS_DIR = os.path.join(OUTDIR, "plans_per_replan{i}")
+    PLANS_DIR = os.path.join(OUTDIR, f"plans_per_replan{i}")
     os.makedirs(PLANS_DIR, exist_ok=True)
     exec_xy, goal_xy, last_s0_vec, last_eps_mean, first_s0_vec, first_eps_mean, all_s0,reached_goal = run_skills_iterative_replanning(env,skill_seq_len=skill_seq_len,H=H,execute_n_skills=1,max_replans=max_replans,use_epsilon=True,goal_thresh2=1.0,deterministic=False)
     if reached_goal:
