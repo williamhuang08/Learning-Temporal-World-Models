@@ -14,14 +14,15 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 
-from cem import cem
+from planner.cem import cem
 from model.skill_model import SkillPolicy, SkillPosterior, SkillPrior, TAWM, MoGSkillPrior
-from model.utils import load_checkpoint
-from model.dataloader import SubtrajDataset, collate
-from utils import obs_to_state_vec, xy_from_state
+from model.utils import load_checkpoint, pack_state_from_obs
+from model.offline.dataloader import SubtrajDataset, collate, make_episode_splits
+from planner.utils import obs_to_state_vec, xy_from_state
+
+from matplotlib.image import imread
 
 sys.path.append(os.path.abspath(".."))
-from utils import SubtrajDataset, make_episode_splits, collate
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -40,7 +41,7 @@ env = strip_timelimit(env)
 env = TimeLimit(env, max_episode_steps=4000) # set maximum number of episode steps
 
 # Environment variables
-prior_type = "mog"
+prior_type = "uni"
 skill_seq_len = 10
 H = 40
 replan_freq = H
@@ -78,31 +79,49 @@ random_goal = False # determines if we select a goal at random from dataset (ran
 # filename = 'antmaze_diverse_detached_250_1.pth'
 # filename = 'kl_balancing/antmaze_diverse_detached_klbalance_epoch75_beta1.0_gamma0.001.pth'
 # filename = 'kl_balancing_MoG_knn/antmaze_diverse_detached_klbalance_mog_knn_epoch100_beta0.001_gamma1-lambda0.1.pth'
-filename = 'kl_balancing_MoG/beta_gamma/antmaze_diverse_detached_klbalance_mog_epoch100_beta0.001_gamma1-unfiltered.pth'
+# filename = 'kl_balancing_MoG/beta_gamma/antmaze_diverse_detached_klbalance_mog_epoch100_beta0.001_gamma1-unfiltered.pth'
 # filename = 'kl_balancing_MoG/beta_gamma/antmaze_diverse_detached_klbalance_mog_epoch2000_beta0.001_gamma1-filtered.pth'
+# filename = 'kl_balancing_MoG/beta_gamma/antmaze_diverse_detached_klbalance_mog_epoch200_beta1_gamma0.1.pth'
+# filename = 'kl_balancing_MoG/beta_gamma/antmaze_diverse_detached_klbalance_mog_epoch200_beta1_gamma0.1.pth'
+# filename = 'kl_balancing_MoG/beta_gamma/mog_epoch200_beta1_gamma1.pth'
+filename = 'one_optimizer/uni_epoch91_beta1_best.pth'
+filename = 'em_optimizer/em_epoch93_beta1_best.pth'
+filename = 'em_optimizer/em_epoch128_beta1_best.pth'
+# filename = 'one_optimizer/antmaze_diverse_detached_250_1.pth'
+# filename = 'em_optimizer/antmaze_diverse_em_250_1.pth'
 
-PATH = '../checkpoints/' + filename
+PATH = 'checkpoints/' + filename
 
-OUTDIR = "planning"
+OUTDIR = "planner/planning"
 PLANS_DIR = os.path.join(OUTDIR, "plans_per_replan16")
 os.makedirs(PLANS_DIR, exist_ok=True)
+
+BG_PATH = "planner/planning/bg_img.jpeg" 
+margin = 1
+BG_EXTENT = (-10 - margin, 10 + margin, -10 - margin, 10 + margin)  
+
+bg_img = imread(BG_PATH)
 
 skillpost = SkillPosterior(state_dim=state_dim, action_dim=a_dim).to(device)
 llpolicy = SkillPolicy(state_dim=state_dim, action_dim=a_dim).to(device)
 tawm = TAWM(state_dim=state_dim).to(device)
-# skillprior = SkillPrior(state_dim=state_dim).to(device)
-skillprior = MoGSkillPrior(state_dim=state_dim).to(device)
+skillprior = SkillPrior(state_dim=state_dim).to(device)
+# skillprior = MoGSkillPrior(state_dim=state_dim).to(device)
 _ = load_checkpoint(PATH, skillpost, llpolicy, tawm, skillprior)
 
+skillpost.eval()
+llpolicy.eval()
+tawm.eval()
+skillprior.eval()
 
 train_ids, val_ids, test_ids = make_episode_splits(
-    data, train=0.8, val=0.0, test=0.2, seed=0
+    data, train=0.8, val=0.1, test=0.1, seed=0
 )
 print(f"train episodes:{len(train_ids)}  val episodes:{len(val_ids)}  test episodes:{len(test_ids)}")
 
-train_ds = SubtrajDataset(data, T=H, episode_ids=train_ids, stride=3)
-val_ds   = SubtrajDataset(data, T=H, episode_ids=val_ids,   stride=3)
-test_ds  = SubtrajDataset(data, T=H, episode_ids=test_ids,  stride=3)
+train_ds = SubtrajDataset(data, T=H, episode_ids=train_ids, stride=1)
+val_ds   = SubtrajDataset(data, T=H, episode_ids=val_ids,   stride=1)
+test_ds  = SubtrajDataset(data, T=H, episode_ids=test_ids,  stride=1)
 
 print(f"train subtrajs:{len(train_ds)}  val subtrajs:{len(val_ds)}  test subtrajs:{len(test_ds)}")
 
@@ -129,7 +148,7 @@ def build_xy_cache(minari_dataset):
 
     return episodes_xy, np.stack(starts, axis=0), np.concatenate(all_xy, axis=0)
 
-episodes_xy, episodes_start_xy, all_xy = build_xy_cache(data)
+# episodes_xy, episodes_start_xy, all_xy = build_xy_cache(data)
 
 def pick_nearby_ep(episodes_start_xy, current_xy):
     d2 = np.sum((episodes_start_xy - current_xy.reshape(1, 2))**2, axis=1)
@@ -159,74 +178,104 @@ def build_antmaze_background(minari_dataset, bins=300, stride=1):
 
     return bg_img, extent, x_centers, y_centers, occ
 
-@torch.no_grad()
-def mog_mean_std(skillprior, s):
-    "Samples one of the K Gaussians for each batch element and samples "
-    logits, mean, std = skillprior(s)          
-    # k = torch.distributions.Categorical(logits=logits).sample()                 
-    # # gather the mean and std of the corresponding kth gaussian
-    # idx = k.unsqueeze(-1).unsqueeze(-1).expand(*mean.shape[:-2], 1, mean.shape[-1]) 
-    # mu_k  = mean.gather(dim=-2, index=idx).squeeze(-2)   
-    # std_k = std.gather(dim=-2, index=idx).squeeze(-2)    
-    # return mu_k, std_k
-    k = torch.argmax(logits, dim=-1)
-    idx = k[..., None, None].expand(*mean.shape[:-2], 1, mean.shape[-1])
-    mu = mean.gather(-2, idx).squeeze(-2)
-    sig = std.gather(-2, idx).squeeze(-2)
-    return mu, sig
+def plot_global_bg(all_xy):
+    fig, ax = plt.subplots(figsize=(6, 6))
+
+    ax.scatter(all_xy[:, 0], all_xy[:, 1], s=2, alpha=0.18, color="gray")
+
+    ax.set_xlim(-10, 10)
+    ax.set_ylim(-10, 10)
+    ax.set_aspect("equal", "box")
+    ax.axis("off")
+
+    fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
+    plt.savefig('planner/planning/bg_img.jpeg')
+
+def draw_antmaze_bg(ax):
+    ax.imshow(
+        bg_img,
+        extent=(-10 - margin, 10 + margin, -10 - margin, 10 + margin),
+        origin="upper",
+        aspect="equal",
+        zorder=0,
+        alpha=0.55
+    )
 
 
 @torch.no_grad()
-def policy_action(llpolicy, state_vec, z_vec, deterministic=True):
-    """
-    Review:
-    Uses the low level policy to sample an action.
-    """
-    s = torch.tensor(state_vec, dtype=torch.float32, device=device).unsqueeze(0)  
-    z = z_vec.view(1, -1)                                                      
-    mu, std = llpolicy(s, z)
+def policy_action(llpolicy, state_vec, z_vec, deterministic=False):
+    state = torch.tensor(
+        state_vec, dtype=torch.float32, device=device
+    ).view(1, 1, -1)
+
+    z = z_vec.view(1, 1, -1).to(device)
+
+    mu, std = llpolicy(state, z)
 
     if deterministic:
-        a = mu
+        action = mu
     else:
-        std = std.clamp_min(0.05)
-        a = mu + std * torch.randn_like(mu)
+        eps = torch.randn_like(mu)
+        action = mu + std * eps
 
-    # a = torch.tanh(a)
-    return a.squeeze(0).cpu().numpy()
+    return action.detach().cpu().numpy().reshape(-1)
 
+# def convert_epsilon_to_z(epsilon, s0_vec, prior_type):
+#     """
+#     Converts sequence of epsilons to a sequence of skills.
+
+#     epsilon [B, L, Z]
+#     s0_vec  [state_dim]
+#     """
+#     s = torch.tensor(s0_vec, dtype=torch.float32, device=device).unsqueeze(0)  # [1,state_dim]
+#     B, L, _ = epsilon.shape
+#     s = s.expand(B, -1)
+
+#     z_seq = []
+#     for i in range(L):
+#         if prior_type == "uni":
+#             mu_z, sigma_z = skillprior(s) # [B,Z]
+#             eps_i = epsilon[:, i, :] # [B,Z]
+#             z_i = mu_z + sigma_z * eps_i # [B,Z]
+#             z_seq.append(z_i.unsqueeze(1)) # [B,1,Z]
+#         else:   
+#             logits, mu_z, sigma_z = skillprior(s) # [B,Z]
+#             k = torch.distributions.Categorical(logits=logits).sample().item()
+#             mu_k  = mu_z[0, k]                             
+#             std_k = sigma_z[0, k]    
+#             eps_i = epsilon[:, i, :] # [B,Z]
+#             z_i = mu_k + std_k * eps_i # [B,Z]
+#             z_seq.append(z_i.unsqueeze(1)) # [B,1,Z]
+        
+#         s_mean, _ = tawm(s, z_i)
+#         s = s_mean
+#     return torch.cat(z_seq, dim=1)
+                
 def convert_epsilon_to_z(epsilon, s0_vec, prior_type):
     """
-    Converts sequence of epsilons to a sequence of skills.
-
-    epsilon: [B, L, Z]
-    s0_vec:  [state_dim]
-    returns z_seq: [B, L, Z]
+    epsilon is [B, L, Z]
+    return [B, L, Z]
     """
-    s = torch.tensor(s0_vec, dtype=torch.float32, device=device).unsqueeze(0)  # [1,state_dim]
+    s = torch.tensor(s0_vec, dtype=torch.float32, device=device).view(1, 1, -1)
     B, L, _ = epsilon.shape
-    s = s.expand(B, -1)
+    s = s.expand(B, 1, -1)
 
     z_seq = []
     for i in range(L):
+        eps_i = epsilon[:, i:i+1, :]   # [B,1,Z]
+
         if prior_type == "uni":
-            mu_z, sigma_z = skillprior(s) # [B,Z]
-            eps_i = epsilon[:, i, :] # [B,Z]
-            z_i = mu_z + sigma_z * eps_i # [B,Z]
-            z_seq.append(z_i.unsqueeze(1)) # [B,1,Z]
-        else:   
-            logits, mu_z, sigma_z = skillprior(s) # [B,Z]
-            k = torch.distributions.Categorical(logits=logits).sample().item()
-            mu_k  = mu_z[0, k]                             
-            std_k = sigma_z[0, k]    
-            eps_i = epsilon[:, i, :] # [B,Z]
-            z_i = mu_k + std_k * eps_i # [B,Z]
-            z_seq.append(z_i.unsqueeze(1)) # [B,1,Z]
-        
+            mu_z, sigma_z = skillprior(s)
+            z_i = mu_z + sigma_z * eps_i
+        else:
+            mu_z, sigma_z = mog_mean_std(skillprior, s)
+            z_i = mu_z + sigma_z * eps_i
+
+        z_seq.append(z_i)
         s_mean, _ = tawm(s, z_i)
         s = s_mean
+
     return torch.cat(z_seq, dim=1)
-                
 
 def get_expected_cost_variable_length(s0, skill_seq, lengths, goal_state, use_epsilons=True, plot=False):
 		'''
@@ -289,12 +338,47 @@ def get_expected_cost_variable_length(s0, skill_seq, lengths, goal_state, use_ep
 			plt.savefig('pred_states_cem_variable_length_FULL_SEQ')
 		return costs
 
+# def get_expected_cost_for_cem(s0, eps_seq, goal_xy, prior_type, length_cost=0.0):
+#     """
+#     Returns the cost of the eps_seq which is the minimum distance along the whole skill sequence to the goal.
+
+#     s0: [B,1,sd] ,eps_seq: [B,L,Z] ,goal_xy: [2] 
+#     """
+#     s = s0.squeeze(1) # [B, D]
+
+#     goal_xy = goal_xy.view(1, 2).expand(s.shape[0], -1)  # [B,2] (keep second dimension (2) unchanged)
+
+#     B, L, _ = eps_seq.shape
+
+#     costs = []
+#     pred_states = [s]
+#     # cost at t=0
+#     costs.append(((s[:, -2:] - goal_xy) ** 2).mean(dim=-1))
+#     for i in range(L):
+#         if prior_type == "uni":
+#             mu_z, sigma_z = skillprior(s)       
+#         else:
+#             mu_z, sigma_z = mog_mean_std(skillprior, s)
+
+#         eps_i = eps_seq[:, i, :]
+#         z_i = mu_z + sigma_z * eps_i           
+
+#         s, _ = tawm(s, z_i)                   
+#         costs.append(((s[:, -2:] - goal_xy) ** 2).mean(dim=-1) + (i+1)*length_cost) # sequences are preferred when they are closer to the goal earlier on in the sequence
+#         pred_states.append(s)
+
+#     costs = torch.stack(costs, dim=1) # [B,L+1]
+#     best, _ = torch.min(costs, dim=1)  # [B]
+#     # return costs[:, -1]
+#     return best
+
+
 def get_expected_cost_for_cem(s0, eps_seq, goal_xy, prior_type, length_cost=0.0):
     """
     Returns the cost of the eps_seq which is the minimum distance along the whole skill sequence to the goal.
 
-    s0: [B,1,sd] ,eps_seq: [B,L,Z] ,goal_xy: [2] 
-    returns: [B] costs
+    s0 is [B,1,sd] ,eps_seq is [B,L,Z] ,goal_xy is [2] 
+    returns [B] costs
     """
     s = s0.squeeze(1) # [B, D]
 
@@ -323,6 +407,7 @@ def get_expected_cost_for_cem(s0, eps_seq, goal_xy, prior_type, length_cost=0.0)
     best, _ = torch.min(costs, dim=1)  # [B]
     # return costs[:, -1]
     return best
+
 
 def run_skills_iterative_replanning(env,
     skill_seq_len=skill_seq_len,
@@ -364,8 +449,17 @@ def run_skills_iterative_replanning(env,
         s_batch = torch.tensor(state_vec, dtype=torch.float32, device=device).view(1,1,-1).expand(batch_size, 1, state_dim)   # [B,1,sd]
         goal_xy_t = torch.tensor(goal_xy, dtype=torch.float32, device=device)
 
-        cost_fn = lambda eps_seq: get_expected_cost_for_cem(s_batch, eps_seq, goal_xy_t, prior_type, length_cost=plan_length_cost)
-
+        # cost_fn = lambda eps_seq: get_expected_cost_for_cem(s_batch, eps_seq, goal_xy_t, prior_type, length_cost=plan_length_cost)
+        cost_fn = lambda eps_seq: get_expected_cost_for_cem(
+            s_batch, eps_seq, goal_xy_t, prior_type, length_cost=plan_length_cost
+        )
+        # cost_fn = lambda eps_seq: get_expected_cost_for_cem(
+        #     s_batch, eps_seq, goal_xy_t, prior_type,
+        #     length_cost=0.01,
+        #     step_cost_coef=0.5,
+        #     unc_cost_coef=0.05,
+        #     use_stochastic_rollout=True,
+        # )
         # if random.random() < 0.5:
         #     eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
         #     eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
@@ -377,38 +471,78 @@ def run_skills_iterative_replanning(env,
         #         eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
         #         eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
         # if last_eps_mean is None:
-        #     eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
-        #     eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
+            # eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
+            # eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
         # else:
         #     eps_mean = torch.cat([last_eps_mean[1:], torch.zeros(1, z_dim, device=device)], dim=0)
         #     eps_std  = torch.cat([last_eps_std[1:],  torch.ones(1, z_dim, device=device)], dim=0)
+        # eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
+        # eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
+     
         eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
-        eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
-        eps_mean, eps_std = cem(eps_mean, eps_std, cost_fn,pop_size=batch_size, frac_keep=keep_frac, n_iters=n_iters,l2_pen=cem_l2_pen)
-        if first_eps_mean == None:
-             first_eps_mean = eps_mean
+        eps_std  = torch.ones((skill_seq_len, z_dim), device=device)     
+
+        # run CEM initialized from warm start
+        eps_mean, eps_std = cem(
+            eps_mean,
+            eps_std,
+            cost_fn,
+            pop_size=batch_size,
+            frac_keep=keep_frac,
+            n_iters=n_iters,
+            l2_pen=cem_l2_pen
+        )
 
         last_eps_mean = eps_mean.detach().clone()
-        last_eps_std = eps_std.detach().clone()
+        last_eps_std  = eps_std.detach().clone()
+
+        # save optimized plan
+        # eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
+        # eps_std  = torch.ones((skill_seq_len, z_dim), device=device)     
+
+        # if first_eps_mean is None:
+        #     first_eps_mean = eps_mean.detach().clone()
+
+        # last_eps_mean = eps_mean.detach().clone()
+        # last_eps_std = eps_std.detach().clone() 
+        # eps_mean, eps_std = cem(eps_mean, eps_std, cost_fn,pop_size=batch_size, frac_keep=keep_frac, n_iters=n_iters,l2_pen=cem_l2_pen)
+        # if first_eps_mean == None:
+        #      first_eps_mean = eps_mean
+
+        # last_eps_mean = eps_mean.detach().clone()
+        # last_eps_std = eps_std.detach().clone()
 
         # starting from this state, tawm dist for following 10 skills
         plan_means_xy, plan_stds_xy = tawm_plan_xy(state_vec, eps_mean, prior_type, n_std = 1)
 
         # call run_skill_seq
-        eps_exec = eps_mean[:execute_n_skills]  # (execute_n_skills, Z)
+        eps_exec = eps_mean[:execute_n_skills].unsqueeze(0)   # [1, L, Z]
+        # debug_one_skill(state_vec, eps_exec)
 
-        state_vec, executed_xy, done, per_skill_exec_xy, reached_goal = run_skill_seq(env,state_vec,eps_exec,prior_type,use_epsilon=use_epsilon,H=H,goal_xy=goal_xy,goal_thresh2=goal_thresh2,deterministic=deterministic,executed_xy=executed_xy)
+        z_exec = convert_epsilon_to_z(eps_exec, state_vec, prior_type).squeeze(0)  # [L, Z]
+        state_vec, executed_xy, done, per_skill_exec_xy, reached_goal = run_skill_seq(
+            env,
+            state_vec,
+            z_exec,
+            prior_type,
+            use_epsilon=False,
+            H=H,
+            goal_xy=goal_xy,
+            goal_thresh2=goal_thresh2,
+            deterministic=deterministic,
+            executed_xy=executed_xy
+        )
 
         executed_skill_xy = per_skill_exec_xy[0]
 
         print(f"replan {repl}] xy={state_vec[-2:]} dist to the goal={np.sum((state_vec[-2:] - goal_xy)**2):.3f}")
 
-        nearby_idx = pick_nearby_ep(episodes_start_xy, cur_xy)
-        nearby_trajs = [episodes_xy[i] for i in nearby_idx]
+        # nearby_idx = pick_nearby_ep(episodes_start_xy, cur_xy)
+        # nearby_trajs = [episodes_xy[i] for i in nearby_idx]
 
         outpath = os.path.join(PLANS_DIR, f"replan_{repl:05d}.png")
-        save_replan_figure(outpath, all_xy, cur_xy, goal_xy, plan_means_xy, plan_stds_xy, executed_xy, executed_skill_xy, nearby_trajs, title=f"replan {repl}")
-        # save_replan_figure(outpath, all_xy, cur_xy, goal_xy, plan_means_xy, plan_stds_xy, executed_xy, executed_skill_xy, title=f"replan {repl}")
+        # save_replan_figure(outpath, all_xy, cur_xy, goal_xy, plan_means_xy, plan_stds_xy, executed_xy, executed_skill_xy, nearby_trajs, title=f"replan {repl}")
+        save_replan_figure(outpath, cur_xy, goal_xy, plan_means_xy, plan_stds_xy, executed_xy, executed_skill_xy, None, title=f"replan {repl}")
 
         if done:
             break
@@ -417,34 +551,34 @@ def run_skills_iterative_replanning(env,
     return np.stack(executed_xy, axis=0), goal_xy, last_s0_vec, last_eps_mean, first_state_vec, first_eps_mean, all_s0, reached_goal
 
 
-def run_skill_seq(env, state_vec, eps_seq, prior_type, use_epsilon=True, H=40,
+def run_skill_seq(env, state_vec, skill_seq, prior_type, use_epsilon=True, H=40,
                   goal_xy=None, goal_thresh2=1.0, deterministic=False,
                   executed_xy=None):
-    """
-    Executes a skill seq using the policy and returns the new state (and xy-locations).
-    """
     if executed_xy is None:
         executed_xy = [state_vec[-2:].copy()]
 
-    L = eps_seq.shape[0]
+    L = skill_seq.shape[0]
     done = False
     per_skill_exec_xy = []
 
     for i in range(L):
-        # choose z for this skill
-        s_t = torch.tensor(state_vec, dtype=torch.float32, device=device).unsqueeze(0)  # [1,sd]
         if use_epsilon:
+            s_t = torch.tensor(state_vec, dtype=torch.float32, device=device).view(1, 1, -1)
+            eps_i = skill_seq[i].view(1, 1, -1)
+
             if prior_type == "uni":
-                mu_z, sigma_z = skillprior(s_t)                         
-                z = mu_z + sigma_z * eps_seq[i:i+1, :]  
+                mu_z, sigma_z = skillprior(s_t)
+                z = mu_z + sigma_z * eps_i
             else:
                 mu_z, sigma_z = mog_mean_std(skillprior, s_t)
-                z = mu_z + sigma_z * eps_seq[i:i+1, :]
+                z = mu_z + sigma_z * eps_i
+        else:
+            z = skill_seq[i].view(1, 1, -1).to(device)
 
         skill_xy = []
-        # execute low-level steps for H 
+
         for t in range(H):
-            a = policy_action(llpolicy, state_vec, z, deterministic=deterministic)  
+            a = policy_action(llpolicy, state_vec, z, deterministic=deterministic)
             obs, reward, terminated, truncated, info = env.step(a)
             done = terminated or truncated
 
@@ -453,15 +587,16 @@ def run_skill_seq(env, state_vec, eps_seq, prior_type, use_epsilon=True, H=40,
             executed_xy.append(xy)
             skill_xy.append(xy)
 
-            if goal_xy is not None:
-                if np.sum((state_vec[-2:] - goal_xy) ** 2) < goal_thresh2:
-                    per_skill_exec_xy.append(np.asarray(skill_xy, dtype=np.float32))
-                    return state_vec, executed_xy, True, per_skill_exec_xy, True
+            if goal_xy is not None and np.sum((state_vec[-2:] - goal_xy) ** 2) < goal_thresh2:
+                per_skill_exec_xy.append(np.asarray(skill_xy, dtype=np.float32))
+                return state_vec, executed_xy, True, per_skill_exec_xy, True
 
             if done:
                 per_skill_exec_xy.append(np.asarray(skill_xy, dtype=np.float32))
                 return state_vec, executed_xy, True, per_skill_exec_xy, False
-        per_skill_exec_xy.append(np.asarray(skill_xy, np.float32))
+
+        per_skill_exec_xy.append(np.asarray(skill_xy, dtype=np.float32))
+
     return state_vec, executed_xy, False, per_skill_exec_xy, False
 
 
@@ -484,7 +619,6 @@ def tawm_plan_xy(s0_vec_np, eps_plan, prior_type, n_std=2.0):
         else:
             mu_z, sigma_z = mog_mean_std(skillprior, s)
             z = mu_z + sigma_z * eps_plan[i:i+1, :]  
-
         s_mean, s_std = tawm(s, z)                
         s = s_mean                                 
 
@@ -513,6 +647,7 @@ def plot_plan_blobs_vs_exec_with_bg(all_xy,
     exec_xy = np.asarray(executed_xy, dtype=np.float32)
 
     fig, ax = plt.subplots(figsize=(6.8, 6.4))
+    draw_antmaze_bg(ax)
 
     # ax.imshow(
     #     bg_img.T,                 
@@ -554,7 +689,6 @@ def plot_plan_blobs_vs_exec_with_bg(all_xy,
 
 def save_replan_figure(
     outpath,
-    all_xy,
     current_xy,
     goal_xy,
     plan_means_xy,
@@ -568,15 +702,13 @@ def save_replan_figure(
     skill_xy = np.asarray(executed_skill_xy, dtype=np.float32) if executed_skill_xy is not None else None
 
     fig, ax = plt.subplots(figsize=(7.2, 6.6))
+    draw_antmaze_bg(ax)
 
-    # Background scatter (light)
-    if all_xy is not None and all_xy.shape[0] > 0:
-        ax.scatter(all_xy[:, 0], all_xy[:, 1], s=2, alpha=0.10, color="lightgray", zorder=1)
-
-    # # Nearby dataset subtrajectories (thin)
-    for traj in nearby_episode_xys:
-        if traj.shape[0] > 1:
-            ax.plot(traj[:, 0], traj[:, 1], linewidth=1.0, alpha=0.25, zorder=2)
+    # # Nearby dataset subtrajectories
+    if nearby_episode_xys is not None:
+        for traj in nearby_episode_xys:
+            if traj.shape[0] > 1:
+                ax.plot(traj[:, 0], traj[:, 1], linewidth=1.0, alpha=0.25, zorder=2)
 
     # Just-executed skill (red)
     if skill_xy is not None and skill_xy.shape[0] > 0:
@@ -610,8 +742,12 @@ def save_replan_figure(
     pts = np.vstack(pts)
     lo, hi = pts.min(axis=0), pts.max(axis=0)
     pad = 0.10 * (hi - lo + 1e-6)
-    ax.set_xlim(lo[0] - pad[0], hi[0] + pad[0])
-    ax.set_ylim(lo[1] - pad[1], hi[1] + pad[1])
+    # ax.set_xlim(lo[0] - pad[0], hi[0] + pad[0])
+    # ax.set_ylim(lo[1] - pad[1], hi[1] + pad[1])
+
+    # To match antmaze bg
+    ax.set_xlim(BG_EXTENT[0], BG_EXTENT[1])
+    ax.set_ylim(BG_EXTENT[2], BG_EXTENT[3])
 
     plt.tight_layout()
     plt.savefig(outpath, dpi=220)
@@ -621,6 +757,7 @@ def save_replan_figure(
 def save_final_trajectory(outpath, executed_xy, goal_xy, all_s0):
     exec_xy = np.asarray(executed_xy, dtype=np.float32)
     fig, ax = plt.subplots(figsize=(7.0, 6.5))
+    draw_antmaze_bg(ax)
 
     if exec_xy.shape[0] > 1:
         ax.plot(exec_xy[:, 0], exec_xy[:, 1], color="red", linewidth=3.0, zorder=2, label="executed")
@@ -637,18 +774,34 @@ def save_final_trajectory(outpath, executed_xy, goal_xy, all_s0):
     pts = np.vstack([exec_xy, goal_xy.reshape(1,2)]) if exec_xy.size else goal_xy.reshape(1,2)
     lo, hi = pts.min(axis=0), pts.max(axis=0)
     pad = 0.10 * (hi - lo + 1e-6)
-    ax.set_xlim(lo[0] - pad[0], hi[0] + pad[0])
-    ax.set_ylim(lo[1] - pad[1], hi[1] + pad[1])
+    # ax.set_xlim(lo[0] - pad[0], hi[0] + pad[0])
+    # ax.set_ylim(lo[1] - pad[1], hi[1] + pad[1])
+
+    # To match antmaze bg
+    ax.set_xlim(BG_EXTENT[0], BG_EXTENT[1])
+    ax.set_ylim(BG_EXTENT[2], BG_EXTENT[3])
 
     plt.tight_layout()
     plt.savefig(outpath, dpi=240)
     plt.close(fig)
     print(f"saved -> {outpath}")
 
+
+"""
+UNCOMMENT TO SAVE IMAGE OF ANTMAZE BACKGROUND
+all_xy = []
+for ep in data.iterate_episodes():
+    xy = ep.observations["achieved_goal"][:, :2]  
+    all_xy.append(xy)
+all_xy = np.concatenate(all_xy, axis=0)
+
+plot_global_bg(all_xy)
+"""
+
 num_successes = 0
 num_trials = 500
 for i in range(num_trials):
-    exec_xy, goal_xy, last_s0_vec, last_eps_mean, first_s0_vec, first_eps_mean, all_s0,reached_goal = run_skills_iterative_replanning(env,skill_seq_len=skill_seq_len,H=H,execute_n_skills=1,max_replans=max_replans,use_epsilon=True,goal_thresh2=1.0,deterministic=True)
+    exec_xy, goal_xy, last_s0_vec, last_eps_mean, first_s0_vec, first_eps_mean, all_s0,reached_goal = run_skills_iterative_replanning(env,skill_seq_len=skill_seq_len,H=H,execute_n_skills=1,max_replans=max_replans,use_epsilon=True,goal_thresh2=1.0,deterministic=False)
     if reached_goal:
         num_successes += 1
 success_rate = num_successes / num_trials
@@ -672,4 +825,3 @@ env.close()
 #         all_xy, exec_xy, planned_means_xy, planned_stds_xy, goal_xy ,outpath="plan_blobs_vs_exec_bg.png",
 #         n_std=2.0
 #     )
-
