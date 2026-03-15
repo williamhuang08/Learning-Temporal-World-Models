@@ -545,7 +545,7 @@ def run_skills_iterative_replanning(env,
         if done:
             break
 
-    save_final_trajectory(os.path.join(OUTDIR, f"final_executed_trajectory.png"), executed_xy, goal_xy, all_s0)
+    save_final_trajectory(os.path.join(OUTDIR, f"{PLANS_DIR}/final_executed_trajectory.png"), executed_xy, goal_xy, all_s0)
     return np.stack(executed_xy, axis=0), goal_xy, last_s0_vec, last_eps_mean, first_state_vec, first_eps_mean, all_s0, reached_goal
 
 
