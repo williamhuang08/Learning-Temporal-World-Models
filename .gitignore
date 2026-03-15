@@ -9,7 +9,11 @@ learning_temporal_world_models.egg-info/
 wandb/
 plots/
 
-model/model.ipynb
-model/visualize_models.ipynb
+model/offline/multimodal_states/
+model/offline/model.ipynb
+model/offline/visualize_models.ipynb
+model/__pychache__/
+model/wandb/
+model/plots/
 
 .wandb_key
