@@ -9,7 +9,7 @@ def save_checkpoint(path, q_phi, pi_theta, p_psi, p_omega, B, T, Z_DIM, NUM_NEUR
         "pi_theta": pi_theta.state_dict(),
         "p_psi": p_psi.state_dict(),
         "p_omega": p_omega.state_dict(),
-        "S_stats": {"mean": S_mean, "std": S_std},
+        # "S_stats": {"mean": S_mean, "std": S_std},
         "config": dict(B=B, T=T, Z_DIM=Z_DIM, NUM_NEURONS=NUM_NEURONS,device=str(device))
     }
     os.makedirs(os.path.dirname(path), exist_ok=True)
