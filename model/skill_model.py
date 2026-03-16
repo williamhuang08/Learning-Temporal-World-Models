@@ -98,7 +98,7 @@ class TAWM(nn.Module):
     1. 2-layer shared network w/ ReLU activations for initial state and abstract skill (concatenated)
     2. Extract mean and std of layer 1's output
     """
-    def __init__(self, state_dim, h_dim=NUM_NEURONS, per_element_sigma=True):
+    def __init__(self, state_dim, h_dim=NUM_NEURONS, per_element_sigma=True, delta=True):
         super().__init__()
         self.state_dim = state_dim
         self.per_element_sigma = per_element_sigma
@@ -133,11 +133,16 @@ class TAWM(nn.Module):
         # s0: [B, state_dim], z: [B, Z_DIM]
         x = torch.cat([s0, z], dim=-1)
         feats = self.layers(x)
-        mean  = self.mean_head(feats)
-        sig   = self.sig_head(feats) 
+        if self.delta:
+            delta_mean = self.mean_head(feats)
+            mean = s0 + delta_mean
+        else:
+            mean = self.mean_head(feats)
         # sig = torch.clamp(sig + 1e-4, min=1e-4, max=10.0)
+        sig = self.sig_head(feats)
         if not self.per_element_sigma:
             sig = sig.expand(-1, self.state_dim)
+        
         return mean, sig
 
 
