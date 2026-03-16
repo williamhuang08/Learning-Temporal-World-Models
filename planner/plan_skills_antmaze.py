@@ -92,7 +92,7 @@ filename = 'em_optimizer/em_epoch128_beta1_best.pth'
 
 PATH = 'checkpoints/' + filename
 
-OUTDIR = "planner/planning"
+OUTDIR = "planner/planning_128"
 
 BG_PATH = "planner/planning/bg_img.jpeg" 
 margin = 1
@@ -798,15 +798,25 @@ plot_global_bg(all_xy)
 
 num_successes = 0
 num_trials = 500
+dists_to_goal = []
 for i in range(num_trials):
     PLANS_DIR = os.path.join(OUTDIR, f"plans_per_replan{i}")
     os.makedirs(PLANS_DIR, exist_ok=True)
     exec_xy, goal_xy, last_s0_vec, last_eps_mean, first_s0_vec, first_eps_mean, all_s0,reached_goal = run_skills_iterative_replanning(env,skill_seq_len=skill_seq_len,H=H,execute_n_skills=1,max_replans=max_replans,use_epsilon=True,goal_thresh2=1.0,deterministic=False)
+    last_s0_xy = last_s0_vec[-2:].astype(np.float32)
+    dist_to_goal = np.linalg.norm(goal_xy - last_s0_xy)
+    dists_to_goal.append(dist_to_goal)
     if reached_goal:
         num_successes += 1
 success_rate = num_successes / num_trials
 
 print(f"Success Rate = {success_rate}")
+plt.hist(dists_to_goal, bins=30, color='skyblue', edgecolor='black') 
+
+plt.title("Histogram of Distances to Goal")
+plt.xlabel("Distance")
+plt.ylabel("Frequency")
+plt.savefig('planner/planning/distance_hist.jpeg')
 
 env.close()
 
