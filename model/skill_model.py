@@ -102,7 +102,8 @@ class TAWM(nn.Module):
         super().__init__()
         self.state_dim = state_dim
         self.per_element_sigma = per_element_sigma
-
+        self.delta = delta
+        
         self.layers = nn.Sequential(
             nn.Linear(state_dim + Z_DIM, h_dim),
             nn.ReLU(),
