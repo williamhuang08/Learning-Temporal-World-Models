@@ -6,13 +6,19 @@ import sys
 import numpy as np
 import random
 import torch
+import mujoco
 import gymnasium as gym
 from gymnasium.wrappers import TimeLimit
 from torch.utils.data import DataLoader
 import matplotlib
-matplotlib.use('Agg')
+# matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 from matplotlib.patches import Ellipse
+from torch.distributions import Normal, Independent, TransformedDistribution
+from torch.distributions.transforms import TanhTransform
+
+
 
 from planner.cem import cem
 from model.skill_model import SkillPolicy, SkillPosterior, SkillPrior, TAWM, MoGSkillPrior
@@ -75,6 +81,7 @@ encoder_type = 'state_action_sequence'
 term_state_dependent_prior = False
 init_state_dependent = True
 random_goal = False # determines if we select a goal at random from dataset (random_goal=True) or use pre-set one from environment
+use_delta = False
 
 # filename = 'antmaze_diverse_detached_250_1.pth'
 # filename = 'kl_balancing/antmaze_diverse_detached_klbalance_epoch75_beta1.0_gamma0.001.pth'
@@ -87,12 +94,15 @@ random_goal = False # determines if we select a goal at random from dataset (ran
 filename = 'one_optimizer/uni_epoch91_beta1_best.pth'
 filename = 'em_optimizer/em_epoch93_beta1_best.pth'
 filename = 'em_optimizer/em_epoch128_beta1_best.pth'
+filename = 'em_optimizer/em(delta)_epoch187_beta1_best.pth'
+# filename = 'em_optimizer/em_epoch241_beta1_best.pth'
+
 # filename = 'one_optimizer/antmaze_diverse_detached_250_1.pth'
 # filename = 'em_optimizer/antmaze_diverse_em_250_1.pth'
 
 PATH = 'checkpoints/' + filename
 
-OUTDIR = "planner/planning_128"
+OUTDIR = "planner/planning/planning_187"
 
 BG_PATH = "planner/planning/bg_img.jpeg" 
 margin = 1
@@ -102,7 +112,7 @@ bg_img = imread(BG_PATH)
 
 skillpost = SkillPosterior(state_dim=state_dim, action_dim=a_dim).to(device)
 llpolicy = SkillPolicy(state_dim=state_dim, action_dim=a_dim).to(device)
-tawm = TAWM(state_dim=state_dim).to(device)
+tawm = TAWM(state_dim=state_dim, delta=use_delta).to(device)
 skillprior = SkillPrior(state_dim=state_dim).to(device)
 # skillprior = MoGSkillPrior(state_dim=state_dim).to(device)
 _ = load_checkpoint(PATH, skillpost, llpolicy, tawm, skillprior)
@@ -469,12 +479,10 @@ def run_skills_iterative_replanning(env,
         #         eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
         #         eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
         # if last_eps_mean is None:
-            # eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
-            # eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
+        #     eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
         # else:
         #     eps_mean = torch.cat([last_eps_mean[1:], torch.zeros(1, z_dim, device=device)], dim=0)
-        #     eps_std  = torch.cat([last_eps_std[1:],  torch.ones(1, z_dim, device=device)], dim=0)
-        # eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
+        #     # eps_std  = torch.cat([last_eps_std[1:],  torch.ones(1, z_dim, device=device)], dim=0)
         # eps_std  = torch.ones((skill_seq_len, z_dim), device=device)
      
         eps_mean = torch.zeros((skill_seq_len, z_dim), device=device)
@@ -785,6 +793,380 @@ def save_final_trajectory(outpath, executed_xy, goal_xy, all_s0):
     print(f"saved -> {outpath}")
 
 
+def get_state_xy(state):
+    s0 = state
+    return s0[-2:].astype(np.float32)
+
+def get_velocity(state):
+    s0 = state
+    x_vel = s0[13].astype(np.float32)
+    y_vel = s0[14].astype(np.float32)
+    z_vel = s0[15].astype(np.float32)
+    return np.array([x_vel, y_vel, z_vel], dtype=np.float32)
+
+def cosine_similarity(vel1, vel2):
+    dot_prod = np.dot(vel1, vel2)
+    vel1_norm = np.linalg.norm(vel1)
+    vel2_norm = np.linalg.norm(vel2)
+    return float(dot_prod) / (vel1_norm * vel2_norm + 1e-8)
+
+def find_similar_subtrajs(ds, failed_state, radius=0.25):
+
+    ref_xy = get_state_xy(failed_state)
+    ref_vel = get_velocity(failed_state)
+
+    near_idxs = []
+    near_dists = []
+
+    # scan all subtrajectories
+    for i, item in enumerate(ds.items):
+        xy = get_state_xy(item[0])
+        vel = get_velocity(item[0])
+        d = np.linalg.norm(xy - ref_xy)
+        if d <= radius:
+            sim = cosine_similarity(vel, ref_vel)
+            if sim > 0.5:
+                near_idxs.append(i)
+                near_dists.append(d)
+
+    # sort by distance (closest first)
+    order = np.argsort(near_dists)
+    near_idxs = [near_idxs[j] for j in order]
+    near_dists = np.asarray([near_dists[j] for j in order], dtype=np.float32)
+    return ref_xy, near_idxs, near_dists
+
+
+def plot_nearby_subtrajectory(
+    ds,
+    all_xy,
+    failed_state,
+    radius=0.25,
+    max_plots=2,
+    overlay_reference=True,
+    linewidth=2.0,
+    alpha=0.35,
+    title=None,
+):
+    ref_xy, near_idxs, near_dists = find_similar_subtrajs(
+        ds, failed_state, radius=radius
+    )
+
+    if len(near_idxs) == 0:
+        print("No nearby subtrajectories found.")
+        return None
+
+    # limit how many to plot
+    plot_idx = near_idxs[:max_plots]
+
+    fig, ax = plt.subplots(figsize=(7.0, 6.5))
+
+    ax.scatter(all_xy[:, 0], all_xy[:, 1],
+            s=2, alpha=0.15, color="lightgray",
+            label="dataset states", zorder=1)
+
+    # plot nearby subtrajectories
+    for i in plot_idx:
+        s0, S, A, sT = ds.items[i]
+        xy = S[:, -2:]
+
+        ax.plot(xy[:, 0], xy[:, 1], lw=linewidth, alpha=alpha)
+
+        # start marker
+        ax.scatter(xy[0, 0], xy[0, 1], s=20, alpha=0.9)
+
+    # mark the reference start
+    ax.scatter(ref_xy[0], ref_xy[1], s=120, marker="X", color="k", zorder=5, label="ref start")
+
+    ax.set_aspect("equal", "box")
+    
+    ax.grid(True, alpha=0.25)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+
+    if title is None:
+        title = f"Subtrajectories starting within r={radius} of failed state (found {len(near_idxs)})"
+    ax.set_title(title)
+    ax.legend(loc="best")
+    plt.tight_layout()
+    # plt.show()
+    plt.savefig("planner/planning/planning_187/nearby_subtraj.png", dpi=200)
+
+all_xy = []
+for ep in data.iterate_episodes():
+    xy = ep.observations["achieved_goal"][:, :2]  
+    all_xy.append(xy)
+
+all_xy = np.concatenate(all_xy, axis=0)
+idx = plot_nearby_subtrajectory(train_ds, all_xy, failed_states[0], radius=0.1, max_plots=50)
+  
+def split_obs_to_qpos_qvel(s0_obs, s0_ag, env):
+    """Split dataset obs into qpos and qvel to reset physics. Need to provide exact qpos and qvel to reset dataset state"""
+    _, model, data = get_sim_handles(env)
+    nq, nv = int(model.nq), int(model.nv)  
+
+    s0_obs = np.asarray(s0_obs, np.float32).ravel()
+    s0_ag  = np.asarray(s0_ag,  np.float32).ravel()
+
+    qpos = data.qpos.ravel().copy()
+    qvel = data.qvel.ravel().copy()
+
+    # fill exact slices
+    qpos[0:2] = s0_ag
+    qpos[2:nq] = s0_obs[:(nq - 2)]
+    qvel[:nv] = s0_obs[(nq - 2):(nq - 2 + nv)]
+
+    return qpos.astype(np.float32), qvel.astype(np.float32)
+
+def set_env_state(env, qpos, qvel):
+    """Write qpos/qvel into MuJoCo and forward."""
+    _, model, data = get_sim_handles(env)
+    # Set the physical state
+    data.qpos[:] = qpos
+    data.qvel[:] = qvel
+    # Required step after makeing a manual state change
+    mujoco.mj_forward(model, data)
+def get_sim_handles(env):
+    """Unwraps Gym wrappers to access MuJoCo model and data to work with qpos/qvel and forward dynamics. 
+    Return (unwrapped MuJoCo environment, MuJoCo model, muJoCo data)"""
+    t = env
+    for attr in ["env", "unwrapped"]: # for the current env, replace env with env.env and then find env.env.unwrapped
+        if hasattr(t, attr):
+            t = getattr(t, attr)
+    # t should now be the innermost env and grab the MuJoCo data and model
+    # sim = getattr(t, "sim", None)
+    # if sim is not None and hasattr(sim, "model") and hasattr(sim, "data"):
+    #     return t, sim.model, sim.data
+    
+    # CHECK THIS
+    if hasattr(t, "model") and hasattr(t, "data"):
+        return t, t.model, t.data
+    
+def to_torch(x):
+    return torch.as_tensor(x, dtype=torch.float32, device=device)
+
+def read_antmaze_obs(env):
+    """Reconstruct AntMaze dict-observation from MuJoCo state."""
+    t = env
+    for attr in ("env", "unwrapped"):
+        if hasattr(t, attr):
+            t = getattr(t, attr)
+    qpos = t.data.qpos.ravel()
+    qvel = t.data.qvel.ravel()
+    obs27 = np.concatenate([qpos[2:], qvel]).astype(np.float32)
+    ag2 = qpos[:2].astype(np.float32)
+    return {"observation": obs27, "achieved_goal": ag2}
+
+def policy_dist(mu, std):
+    # build a tanh-squashed normal action dist
+    base = Independent(Normal(mu, std.clamp_min(0.05)), 1) # clamps std to be at least 0.05 to prevent exploding/vanishing gradients
+    return TransformedDistribution(base, [TanhTransform(cache_size=1)]) # Creates a Independent Normal over action dims applied Tanh Transform to map actions to (-1, 1)
+
+def rollout_xy_trajectories(
+    env,
+    s0_obs_ds,
+    s0_ag_ds=None,
+    N_trajs=3,
+    horizon=H,
+    seed=0,
+    resample_skill_per_traj=True,
+    use_prior=True,
+    z_fixed=None,
+    mog=False
+):
+    """
+    Reset env to dataset start (s0_obs_ds, s0_ag_ds), choose skill z,
+    roll out pi_theta(a|s,z) for H steps.
+    """
+    H = horizon
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    # MuJoCo state for this dataset s0
+    s0_qpos, s0_qvel = split_obs_to_qpos_qvel(s0_obs_ds, s0_ag_ds, env)
+
+    trajs_xy, zs_used = [], []
+
+    # Precompute z if we want same skill for all trajectories
+    z_global = None
+    if not resample_skill_per_traj:
+        env.reset()
+        set_env_state(env, s0_qpos, s0_qvel)
+        obs = read_antmaze_obs(env)
+        _, _, s0_env = pack_state_from_obs(obs)
+        s0_t = to_torch(s0_env).unsqueeze(0)
+
+        if z_fixed is not None:
+            z_global = z_fixed.to(device).detach().clone()
+        elif use_prior:
+            if mog:
+                k = torch.distributions.Categorical(logits=logits_pr).sample().item()
+                mu_k  = mu_pr[0, k]  
+                std_k = std_pr[0, k]                            
+                z = mu_k + std_k * torch.randn_like(mu_k) 
+            else:
+                mu_pr, std_pr = skillprior(s0_t)
+                z_global = (mu_pr + std_pr * torch.randn_like(mu_pr)).squeeze(0)
+
+    for k in range(N_trajs):
+        env.reset()
+        set_env_state(env, s0_qpos, s0_qvel)
+
+        obs = read_antmaze_obs(env)
+        _, ag0, s0_env = pack_state_from_obs(obs)
+        s0_t = to_torch(s0_env).unsqueeze(0)
+
+        if resample_skill_per_traj:
+            if z_fixed is not None:
+                z = z_fixed.to(device).detach().clone()
+            elif use_prior:
+                if mog:
+                    logits_pr, mu_pr, std_pr = skillprior(s0_t)
+                    print(f"weights = {torch.softmax(logits_pr, dim=-1)}")
+                    k = torch.distributions.Categorical(logits=logits_pr).sample().item()
+                    mu_k  = mu_pr[0, k]  
+                    std_k = std_pr[0, k]                            
+                    z = mu_k + std_k * torch.randn_like(mu_k)   
+
+
+                else:
+                    mu_pr, std_pr = skillprior(s0_t)
+                    z = (mu_pr + std_pr * torch.randn_like(mu_pr)).squeeze(0)
+            else:
+                raise ValueError("If use_prior=False and z_fixed is None, no skill source.")
+        else:
+            z = z_global
+
+        zs_used.append(z.detach().cpu())
+
+        xy = [ag0.copy()]
+        cur_obs = obs
+        llpolicy.eval()
+        for t in range(H):
+            _, _, st = pack_state_from_obs(cur_obs)
+            st_t = to_torch(st).unsqueeze(0)
+            a_mu, a_std = llpolicy(st_t, z.unsqueeze(0).to(device))
+            a_dist = policy_dist(a_mu, a_std)
+            a = a_dist.sample().squeeze(0).cpu().numpy().astype(np.float32)
+
+            cur_obs, _, term, trunc, _ = env.step(a)
+            _, ag_t, _ = pack_state_from_obs(cur_obs)
+            xy.append(ag_t.copy())
+            if term or trunc:
+                break
+
+        trajs_xy.append(np.stack(xy, axis=0))
+
+    return trajs_xy, zs_used, s0_env
+
+
+@torch.no_grad()
+def tawm_xy_gaussian(s0_env, z):
+    """
+    Get mean and 2x2 covariance of TAWM's terminal XY
+    """
+    s0_t = to_torch(s0_env).unsqueeze(0)  
+    z_t  = z.unsqueeze(0).to(device)      
+    mu_T, std_T = tawm(s0_t, z_t)      
+    mu_T  = mu_T.squeeze(0).cpu().numpy()
+    std_T = std_T.squeeze(0).cpu().numpy()
+
+    mean_xy = mu_T[-2:]
+    std_xy  = std_T[-2:]
+    cov_xy  = np.diag(std_xy**2)
+    return mean_xy, cov_xy
+
+def draw_cov_ellipse(ax, mean, cov, n_std=2.0, **kwargs):
+    vals, vecs = np.linalg.eigh(cov)
+    order = vals.argsort()[::-1]
+    vals, vecs = vals[order], vecs[:, order]
+    theta = np.degrees(np.arctan2(*vecs[:, 0][::-1]))
+    width, height = 2 * n_std * np.sqrt(vals)
+    ellip = Ellipse(xy=mean, width=width, height=height, angle=theta, fill=False, **kwargs)
+    ax.add_patch(ellip)
+
+def plot_xy_trajectories(trajs_xy, title="", s0_env=None, z=None, demo_xy=None, save=False, stem="traj_detail", meta=None):
+    """
+    Plot each rollout trajectory as a line with start circle, end star.
+    If s0_env and z are given, overlay TAWM ellipses and mean.
+    If demo_xy is given, overlay the dataset subtrajectory used for the posterior.
+    """
+    fig, ax = plt.subplots(figsize=(6.8, 6))
+    colors = cm.get_cmap("viridis", len(trajs_xy))
+
+    all_xy = np.concatenate(trajs_xy, axis=0)
+
+    # rollout posterior trajectories
+    for i, xy in enumerate(trajs_xy):
+        # c = colors_post(i)
+        ax.plot(xy[:, 0], xy[:, 1], "-", lw=1.5, alpha=0.9, color="blue", label=f"post traj {i}")
+        ax.scatter(xy[0, 0],  xy[0, 1],  s=40, marker="o", color="blue", edgecolor="k", zorder=3)
+        ax.scatter(xy[-1,0], xy[-1,1], s=70, marker="*", color="blue", edgecolor="k", zorder=3)
+        # tcolors = np.linspace(0, 1, len(xy))
+        # ax.scatter(xy[:,0], xy[:,1], c=tcolors, cmap="viridis", s=14, alpha=0.8)
+
+    # rollout prior trajectories
+    for i, xy in enumerate(trajs_xy):
+        # c = colors_prior(i)
+        ax.plot(xy[:, 0], xy[:, 1], "-", lw=1.5, alpha=0.9, color="red", label=f"prior traj {i}")
+        ax.scatter(xy[0, 0],  xy[0, 1],  s=40, marker="o", color="red", edgecolor="k", zorder=3)
+        ax.scatter(xy[-1,0], xy[-1,1], s=70, marker="*", color="red", edgecolor="k", zorder=3)
+        # tcolors = np.linspace(0, 1, len(xy))
+        # ax.scatter(xy[:,0], xy[:,1], c=tcolors, cmap="magma", s=14, alpha=0.8)
+
+    # overlay dataset subtrajectory used for posterior
+    if demo_xy is not None:
+        # thick black dashed line for the dataset subtrajectory
+        ax.plot(
+            demo_xy[:, 0], demo_xy[:, 1],
+            "k--", lw=3, alpha=0.9, label="dataset subtrajectory"
+        )
+        # mark its start and end
+        ax.scatter(demo_xy[0, 0], demo_xy[0, 1],
+                   s=80, marker="s", c="k", edgecolor="w", zorder=5)
+        ax.scatter(demo_xy[-1, 0], demo_xy[-1, 1],
+                   s=90, marker="*", c="k", edgecolor="w", zorder=5)
+
+        # include in bounds
+        all_xy = np.vstack([all_xy, demo_xy])
+
+    # TAWM ellipses
+    if (s0_env is not None) and (z is not None):
+        mean_xy, cov_xy = tawm_xy_gaussian(s0_env, z)
+
+        draw_cov_ellipse(ax, mean_xy, cov_xy, n_std=1.0,
+                         edgecolor="darkorange", linewidth=2)
+        draw_cov_ellipse(ax, mean_xy, cov_xy, n_std=2.0,
+                         edgecolor="orange", linestyle="--", linewidth=1.5)
+
+        ax.scatter([mean_xy[0]], [mean_xy[1]],
+                   c="darkorange", s=60, marker="X", zorder=4)
+
+        eigvals = np.linalg.eigvalsh(cov_xy)
+        max_std = np.sqrt(eigvals.max())
+        r = 2.0 * max_std
+        all_xy = np.vstack([
+            all_xy,
+            mean_xy[None, :],
+            mean_xy[None, :] + [r, r],
+            mean_xy[None, :] - [r, r],
+        ])
+
+    lo = all_xy.min(axis=0)
+    hi = all_xy.max(axis=0)
+    pad = 0.05 * (hi - lo + 1e-9)
+    ax.set_xlim(lo[0] - pad[0], hi[0] + pad[0])
+    ax.set_ylim(lo[1] - pad[1], hi[1] + pad[1])
+
+    ax.set_aspect("equal", "box")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    # ax.legend()
+    plt.tight_layout()
+    path = None
+    plt.savefig("planner/planning/planning_187/rollouts.png", dpi=200)
+
 """
 UNCOMMENT TO SAVE IMAGE OF ANTMAZE BACKGROUND
 all_xy = []
@@ -797,17 +1179,22 @@ plot_global_bg(all_xy)
 """
 
 num_successes = 0
-num_trials = 500
+num_trials = 1
+diagnose_terminal_state = True
 dists_to_goal = []
+failed_states = []
+
 for i in range(num_trials):
     PLANS_DIR = os.path.join(OUTDIR, f"plans_per_replan{i}")
     os.makedirs(PLANS_DIR, exist_ok=True)
     exec_xy, goal_xy, last_s0_vec, last_eps_mean, first_s0_vec, first_eps_mean, all_s0,reached_goal = run_skills_iterative_replanning(env,skill_seq_len=skill_seq_len,H=H,execute_n_skills=1,max_replans=max_replans,use_epsilon=True,goal_thresh2=1.0,deterministic=False)
-    last_s0_xy = last_s0_vec[-2:].astype(np.float32)
-    dist_to_goal = np.linalg.norm(goal_xy - last_s0_xy)
+    last_xy = exec_xy[-1].astype(np.float32)
+    dist_to_goal = np.linalg.norm(goal_xy - last_xy)
     dists_to_goal.append(dist_to_goal)
     if reached_goal:
         num_successes += 1
+    else:
+        failed_states.append(last_s0_vec)
 success_rate = num_successes / num_trials
 
 print(f"Success Rate = {success_rate}")
@@ -818,6 +1205,10 @@ plt.xlabel("Distance")
 plt.ylabel("Frequency")
 plt.savefig('planner/planning/distance_hist.jpeg')
 
+if diagnose_terminal_state:
+    post_traj1, _, s0_env1 = rollout_xy_trajectories(env, failed_states[0][:27], failed_states[0][-2:], N_trajs=50, horizon=H, seed=0, resample_skill_per_traj=True, use_prior=True)
+    plot_xy_trajectories(post_traj1, s0_env=s0_env1)
+    
 env.close()
 
 # if last_eps_mean is not None and last_s0_vec is not None:
