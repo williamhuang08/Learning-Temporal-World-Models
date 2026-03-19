@@ -39,6 +39,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # gammas = np.geomspace(0.001, 1, num=4)
 betas = np.array([1]) # increased value of beta term may be beneficial when prior is more expressive or else posterior begins running away from prior
 # gammas = np.array([0.1])
+gamma = 0.8
 
 # According to the paper, each layer contains 256 neurons
 NUM_NEURONS = 256
@@ -94,6 +95,7 @@ test_ds.stats = (S_mean, S_std)
 test_loader = DataLoader(test_ds, batch_size=B, shuffle=False, collate_fn=collate, drop_last=False)
 
 alpha = 1.0
+kl_balance = True
 
 def reparameterize(mean, std):
     eps = torch.randn_like(mean)
@@ -125,10 +127,15 @@ def get_E_loss(batch, beta):
     a_dist = Normal(mu_pi, std_pi)
 
     log_pi = torch.sum(a_dist.log_prob(A)) / denom
+
     log_prior = torch.sum(prior_dist.log_prob(z)) / denom
     log_post = torch.sum(post_dist.log_prob(z)) / denom
 
-    E_loss = -log_pi - beta * log_prior + beta * log_post
+    if kl_balance:
+        kl_loss = torch.mean(torch.sum(kl_divergence(Normal(mu_q, std_q),Normal(mu_pr.detach(), std_pr.detach())), dim=-1)) / T
+        E_loss = -log_pi + beta * (1 - gamma) * kl_loss
+    else:
+        E_loss = -log_pi - beta * log_prior + beta * log_post
     return E_loss
 
 
@@ -164,8 +171,11 @@ def get_M_loss(batch, beta, alpha):
     sT_loss = -torch.sum(sT_dist.log_prob(sT)) / denom
     a_loss = -torch.sum(a_dist.log_prob(A)) / denom
     prior_loss = -torch.sum(prior_dist.log_prob(z)) / denom
-
-    M_loss = alpha * sT_loss + a_loss + beta * prior_loss
+    if kl_balance:
+        kl_loss = torch.mean(torch.sum(kl_divergence(Normal(mu_q.detach(), std_q.detach()),Normal(mu_pr, std_pr)), dim=-1)) / T
+        M_loss = alpha * sT_loss + a_loss + beta * gamma * kl_loss
+    else:
+        M_loss = alpha * sT_loss + a_loss + beta * prior_loss
     return M_loss
 
 
