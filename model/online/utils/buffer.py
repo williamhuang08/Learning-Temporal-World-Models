@@ -87,3 +87,18 @@ def compute_stats(ds):
         all_obs.append(obs_window.reshape(-1, obs_window.shape[-1]))
     S = np.concatenate(all_obs, axis=0)
     return S.mean(0), S.std(0) + 1e-6
+
+def make_episode_splits(minari_dataset, train=0.8, val=0.1, test=0.1, seed=0):
+    """Return three lists of episode indices (train_ids, val_ids, test_ids)."""
+    # Materialize all episodes once so we know how many there are
+    episodes = list(minari_dataset.iterate_episodes())
+    n = len(episodes)
+    idxs = list(range(n))
+    # Shuffle the indices
+    random.Random(seed).shuffle(idxs)
+    n_train = int(round(train * n))
+    n_val = int(round(val * n))
+    train_ids = idxs[:n_train]
+    val_ids = idxs[n_train:n_train+n_val]
+    test_ids = idxs[n_train+n_val:]
+    return train_ids, val_ids, test_ids
