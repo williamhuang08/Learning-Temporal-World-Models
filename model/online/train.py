@@ -17,9 +17,9 @@ from torch.utils.data import DataLoader
 
 from model.online.training.config import ModelConfig, TrainConfig
 from model.online.models import AbstractRSSM, TransformerSkillEncoder, RewardModel, AbstractSkillPrior
-from model.skill_model import SkillPolicy
+from model.online.models.ll_policy import SkillPolicy
 from model.online.utils.buffer import DreamerSubtrajDataset, dreamer_collate, compute_stats
-from model.offline.dataloader import make_episode_splits
+from model.online.utils.buffer import make_episode_splits
 from model.online.training.trainer import dreamer_training_with_val
 
 
@@ -43,6 +43,8 @@ def parse_args():
     parser.add_argument("--beta", type=float, default=TrainConfig.beta)
     parser.add_argument("--alpha_s", type=float, default=TrainConfig.alpha_s)
     parser.add_argument("--reward_weight", type=float, default=TrainConfig.reward_weight)
+    parser.add_argument("--kl_balance", action="store_true", default=TrainConfig.kl_balance)
+    parser.add_argument("--kl_balance_alpha", type=float, default=TrainConfig.kl_balance_alpha)
     parser.add_argument("--lr", type=float, default=TrainConfig.lr)
     parser.add_argument("--grad_clip", type=float, default=TrainConfig.grad_clip)
     parser.add_argument("--e_steps", type=int, default=TrainConfig.e_steps)
@@ -60,6 +62,7 @@ def parse_args():
 
     # logging / infra
     parser.add_argument("--wandb_project", type=str, default=TrainConfig.wandb_project)
+    parser.add_argument("--wandb_run_name", type=str, default=TrainConfig.wandb_run_name)
     parser.add_argument("--save_path", type=str, default="checkpoints/dreamer_rssm")
     parser.add_argument("--normalize_obs", action="store_true",
                         help="Normalize observations with per-feature mean/std")
@@ -98,6 +101,8 @@ def main():
         beta=args.beta,
         alpha_s=args.alpha_s,
         reward_weight=args.reward_weight,
+        kl_balance=args.kl_balance,
+        kl_balance_alpha=args.kl_balance_alpha,
         lr=args.lr,
         grad_clip=args.grad_clip,
         e_steps=args.e_steps,
@@ -111,6 +116,7 @@ def main():
         val_frac=args.val_frac,
         seed=args.seed,
         wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
     )
 
     # --- dataset ---
@@ -198,6 +204,7 @@ def main():
     # --- wandb ---
     wandb.init(
         project=train_cfg.wandb_project,
+        name=train_cfg.wandb_run_name or None,
         config={**model_cfg.__dict__, **train_cfg.__dict__},
     )
 

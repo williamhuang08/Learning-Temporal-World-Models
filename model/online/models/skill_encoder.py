@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class TransformerSkillEncoder(nn.Module):
@@ -21,10 +20,14 @@ class TransformerSkillEncoder(nn.Module):
         n_layers: int = 4,
         dropout: float = 0.1,
         max_seq_len: int = 80,
+        min_std: float = 0.1,
+        max_std: float = 2.0,
     ):
         super().__init__()
         self.d_model = d_model
         self.z_dim = z_dim
+        self.min_std = min_std
+        self.max_std = max_std
 
         self.oa_proj = nn.Linear(obs_dim + action_dim, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
@@ -47,7 +50,6 @@ class TransformerSkillEncoder(nn.Module):
             nn.Linear(d_model, d_model),
             nn.ReLU(),
             nn.Linear(d_model, z_dim),
-            nn.Softplus(),
         )
 
     def forward(self, obs_seq, act_seq):
@@ -67,4 +69,6 @@ class TransformerSkillEncoder(nn.Module):
         out = self.transformer(tokens)  # [B, H, d]
         last = out[:, -1, :]  # readout from last position
 
-        return self.mean_head(last), self.std_head(last)
+        mean = self.mean_head(last)
+        std = self.max_std * torch.sigmoid(self.std_head(last)) + self.min_std
+        return mean, std

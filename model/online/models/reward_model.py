@@ -4,21 +4,25 @@ import torch.nn as nn
 
 class RewardModel(nn.Module):
     """
-    Predict cumulative reward over an H-step skill execution window.
+    Gaussian reward predictor for cumulative reward over an H-step window.
 
     Input:  abstract state s_t and skill z
-    Output: scalar predicted cumulative reward
+    Output: (mean [B], std [B]) parameterising N(reward | mean, std)
     """
 
-    def __init__(self, s_dim: int, z_dim: int, h_dim: int = 256):
+    def __init__(self, s_dim: int, z_dim: int, h_dim: int = 256,
+                 min_std: float = 0.1, max_std: float = 2.0):
         super().__init__()
-        self.net = nn.Sequential(
+        self.min_std = min_std
+        self.max_std = max_std
+        self.trunk = nn.Sequential(
             nn.Linear(s_dim + z_dim, h_dim),
             nn.ReLU(),
             nn.Linear(h_dim, h_dim),
             nn.ReLU(),
-            nn.Linear(h_dim, 1),
         )
+        self.mean_head = nn.Linear(h_dim, 1)
+        self.std_head = nn.Linear(h_dim, 1)
 
     def forward(self, s, z):
         """
@@ -26,6 +30,10 @@ class RewardModel(nn.Module):
             s: [B, s_dim]
             z: [B, z_dim]
         Returns:
-            reward: [B, 1]
+            mean: [B]
+            std:  [B]
         """
-        return self.net(torch.cat([s, z], dim=-1))
+        h = self.trunk(torch.cat([s, z], dim=-1))
+        mean = self.mean_head(h).squeeze(-1)
+        std = self.max_std * torch.sigmoid(self.std_head(h).squeeze(-1)) + self.min_std
+        return mean, std

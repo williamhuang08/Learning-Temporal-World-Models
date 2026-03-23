@@ -19,15 +19,17 @@ import torch.nn as nn
 # ── Dynamics: GRUCell + prior heads (M-step parameters) ──────────────────
 
 class _RSSMDynamics(nn.Module):
-    def __init__(self, s_dim: int, z_dim: int, h_dim: int):
+    def __init__(self, s_dim: int, z_dim: int, h_dim: int,
+                 min_std: float = 0.1, max_std: float = 2.0):
         super().__init__()
+        self.min_std = min_std
+        self.max_std = max_std
         self.gru_cell = nn.GRUCell(s_dim + z_dim, h_dim)
         self.prior_mean = nn.Sequential(
             nn.Linear(h_dim, h_dim), nn.ReLU(), nn.Linear(h_dim, s_dim),
         )
         self.prior_std = nn.Sequential(
             nn.Linear(h_dim, h_dim), nn.ReLU(), nn.Linear(h_dim, s_dim),
-            nn.Softplus(),
         )
 
     def forward(self, h_prev, s_prev, z_prev):
@@ -45,14 +47,19 @@ class _RSSMDynamics(nn.Module):
         """
         x = torch.cat([s_prev, z_prev], dim=-1)
         h_new = self.gru_cell(x, h_prev)
-        return h_new, self.prior_mean(h_new), self.prior_std(h_new)
+        pr_mean = self.prior_mean(h_new)
+        pr_std = self.max_std * torch.sigmoid(self.prior_std(h_new)) + self.min_std
+        return h_new, pr_mean, pr_std
 
 
 # ── Encoder: obs/traj encoder + posterior heads (E-step parameters) ──────
 
 class _RSSMEncoder(nn.Module):
-    def __init__(self, obs_dim: int, action_dim: int, s_dim: int, h_dim: int):
+    def __init__(self, obs_dim: int, action_dim: int, s_dim: int, h_dim: int,
+                 min_std: float = 0.1, max_std: float = 2.0):
         super().__init__()
+        self.min_std = min_std
+        self.max_std = max_std
         # Encode a single observation (for s_0 posterior)
         self.obs_enc = nn.Sequential(
             nn.Linear(obs_dim, h_dim), nn.ReLU(), nn.Linear(h_dim, h_dim),
@@ -71,7 +78,6 @@ class _RSSMEncoder(nn.Module):
         )
         self.post_std = nn.Sequential(
             nn.Linear(h_dim + h_dim, h_dim), nn.ReLU(), nn.Linear(h_dim, s_dim),
-            nn.Softplus(),
         )
 
     def posterior(self, h, context):
@@ -81,7 +87,9 @@ class _RSSMEncoder(nn.Module):
             context: [B, h_dim]  encoded observation or trajectory
         """
         x = torch.cat([h, context], dim=-1)
-        return self.post_mean(x), self.post_std(x)
+        po_mean = self.post_mean(x)
+        po_std = self.max_std * torch.sigmoid(self.post_std(x)) + self.min_std
+        return po_mean, po_std
 
     def encode_obs(self, o):
         """Encode a single observation for s_0 posterior.  o: [B, obs_dim]"""

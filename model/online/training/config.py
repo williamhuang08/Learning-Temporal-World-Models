@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from pdb import run
 
 
 @dataclass
@@ -32,11 +33,15 @@ class ModelConfig:
 class TrainConfig:
     # Loss weights
     beta: float = 1.0          # skill KL weight
-    alpha_s: float = 1.0       # state KL weight
+    alpha_s: float = 0.1       # state KL weight
     reward_weight: float = 1.0
 
+    # KL balancing (DreamerV2-style)
+    kl_balance: bool = True
+    kl_balance_alpha: float = 0.8
+
     # Optimiser
-    lr: float = 5e-5
+    lr: float = 2e-5
     grad_clip: float = 1.0
 
     # EM inner iterations per batch
@@ -56,5 +61,11 @@ class TrainConfig:
     test_frac: float = 0.1
     seed: int = 0
 
+    run_summary: str = "klbalance-True_klbalance_alpha-0.8_beta-1.0_alpha_s-0.1_reward_weight-1.0_lr-2e-5"
+   
     # Logging
     wandb_project: str = "tawm-dreamer"
+    wandb_run_name: str = run_summary
+
+    # Checkpoint Path
+    save_path: str = f"checkpoints/dreamer_rssm/{run_summary}"

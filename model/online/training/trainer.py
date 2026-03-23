@@ -85,10 +85,8 @@ def _rssm_two_step(rssm, skill_enc, obs_seq, act_seq):
 
 
 def _state_kl(post, prior):
-    """KL divergence summed over s_dim, averaged over batch."""
-    return torch.mean(
-        torch.sum(kl_divergence(Normal(*post), Normal(*prior)), dim=-1)
-    )
+    """KL divergence averaged over batch and s_dim (DreamerV2 convention)."""
+    return kl_divergence(Normal(*post), Normal(*prior)).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +97,7 @@ def get_E_loss(
     batch,
     rssm, skill_enc, pi_theta, skill_prior,
     beta, alpha_s,
+    kl_balance=False, kl_balance_alpha=0.8,
 ):
     obs_seq = batch["obs_seq"]
     act_seq = batch["act_seq"]
@@ -110,20 +109,19 @@ def get_E_loss(
     # skill KL — posterior side (prior detached)
     with torch.no_grad():
         z_pr_mean, z_pr_std = skill_prior(info["s0"])
-    skill_kl = torch.mean(
-        torch.sum(kl_divergence(
-            Normal(info["z_mean"], info["z_std"]),
-            Normal(z_pr_mean, z_pr_std),
-        ), dim=-1)
-    )
+    skill_kl = kl_divergence(
+        Normal(info["z_mean"], info["z_std"]),
+        Normal(z_pr_mean, z_pr_std),
+    ).mean()
 
     # state KL — posterior side (RSSM dynamics/prior detached)
     with torch.no_grad():
         s0_pr = (info["s0_prior"][0].detach(), info["s0_prior"][1].detach())
         s1_pr = (info["s1_prior"][0].detach(), info["s1_prior"][1].detach())
-    state_kl = _state_kl(info["s0_post"], s0_pr) + _state_kl(info["s1_post"], s1_pr)
+    state_kl = (_state_kl(info["s0_post"], s0_pr) + _state_kl(info["s1_post"], s1_pr)) / 2
 
-    E_loss = a_loss + beta * skill_kl + alpha_s * state_kl
+    kl_weight = (1 - kl_balance_alpha) if kl_balance else 1.0
+    E_loss = a_loss + kl_weight * beta * skill_kl + kl_weight * alpha_s * state_kl
     return E_loss, {
         "E/a_loss": a_loss.item(),
         "E/skill_kl": skill_kl.item(),
@@ -139,6 +137,7 @@ def get_M_loss(
     batch,
     rssm, skill_enc, pi_theta, skill_prior, reward_model,
     beta, alpha_s, reward_weight,
+    kl_balance=False, kl_balance_alpha=0.8,
 ):
     obs_seq = batch["obs_seq"]
     act_seq = batch["act_seq"]
@@ -161,25 +160,24 @@ def get_M_loss(
 
     # skill KL — prior side (encoder detached)
     z_pr_mean, z_pr_std = skill_prior(info["s0"])
-    skill_kl = torch.mean(
-        torch.sum(kl_divergence(
-            Normal(info["z_mean"], info["z_std"]),
-            Normal(z_pr_mean, z_pr_std),
-        ), dim=-1)
-    )
+    skill_kl = kl_divergence(
+        Normal(info["z_mean"], info["z_std"]),
+        Normal(z_pr_mean, z_pr_std),
+    ).mean()
 
     # state KL — prior side (encoder posteriors detached)
     s0_post_det = (info["s0_post"][0].detach(), info["s0_post"][1].detach())
     s1_post_det = (info["s1_post"][0].detach(), info["s1_post"][1].detach())
-    state_kl = _state_kl(s0_post_det, s0_prior_g) + _state_kl(s1_post_det, s1_prior_g)
+    state_kl = (_state_kl(s0_post_det, s0_prior_g) + _state_kl(s1_post_det, s1_prior_g)) / 2
 
-    r_pred = reward_model(info["s0"], info["z"]).squeeze(-1)
-    reward_loss = F.mse_loss(r_pred, cum_rew)
+    r_mean, r_std = reward_model(info["s0"], info["z"])
+    reward_loss = -Normal(r_mean, r_std).log_prob(cum_rew).mean()
 
+    kl_weight = kl_balance_alpha if kl_balance else 1.0
     M_loss = (
         a_loss
-        + beta * skill_kl
-        + alpha_s * state_kl
+        + kl_weight * beta * skill_kl
+        + kl_weight * alpha_s * state_kl
         + reward_weight * reward_loss
     )
     return M_loss, {
@@ -209,18 +207,16 @@ def get_eval_losses(
     a_loss = _action_nll(pi_theta, obs_seq, info["z"], act_seq)
 
     z_pr_mean, z_pr_std = skill_prior(info["s0"])
-    skill_kl = torch.mean(
-        torch.sum(kl_divergence(
-            Normal(info["z_mean"], info["z_std"]),
-            Normal(z_pr_mean, z_pr_std),
-        ), dim=-1)
-    )
+    skill_kl = kl_divergence(
+        Normal(info["z_mean"], info["z_std"]),
+        Normal(z_pr_mean, z_pr_std),
+    ).mean()
 
-    state_kl = _state_kl(info["s0_post"], info["s0_prior"]) + \
-               _state_kl(info["s1_post"], info["s1_prior"])
+    state_kl = (_state_kl(info["s0_post"], info["s0_prior"]) +
+                _state_kl(info["s1_post"], info["s1_prior"])) / 2
 
-    r_pred = reward_model(info["s0"], info["z"]).squeeze(-1)
-    reward_loss = F.mse_loss(r_pred, cum_rew)
+    r_mean, r_std = reward_model(info["s0"], info["z"])
+    reward_loss = -Normal(r_mean, r_std).log_prob(cum_rew).mean()
 
     total = a_loss + beta * skill_kl + alpha_s * state_kl + reward_weight * reward_loss
     return total, a_loss, skill_kl, state_kl, reward_loss
@@ -354,6 +350,7 @@ def dreamer_training_with_val(
                     batch,
                     rssm, skill_enc, pi_theta, skill_prior,
                     train_cfg.beta, train_cfg.alpha_s,
+                    train_cfg.kl_balance, train_cfg.kl_balance_alpha,
                 )
                 e_loss.backward()
                 if train_cfg.grad_clip is not None:
@@ -369,6 +366,7 @@ def dreamer_training_with_val(
                     rssm, skill_enc, pi_theta, skill_prior, reward_model,
                     train_cfg.beta, train_cfg.alpha_s,
                     train_cfg.reward_weight,
+                    train_cfg.kl_balance, train_cfg.kl_balance_alpha,
                 )
                 m_loss.backward()
                 if train_cfg.grad_clip is not None:
