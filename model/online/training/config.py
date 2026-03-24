@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from pdb import run
 
 
 @dataclass
@@ -61,11 +60,18 @@ class TrainConfig:
     test_frac: float = 0.1
     seed: int = 0
 
-    run_summary: str = "klbalance-True_klbalance_alpha-0.8_beta-1.0_alpha_s-0.1_reward_weight-1.0_lr-2e-5"
-   
     # Logging
     wandb_project: str = "tawm-dreamer"
-    wandb_run_name: str = run_summary
+    wandb_run_name: str = ""
+    save_path: str = ""
 
-    # Checkpoint Path
-    save_path: str = f"checkpoints/dreamer_rssm/{run_summary}"
+    def __post_init__(self):
+        summary = (
+            f"klbal-{self.kl_balance}_alpha-{self.kl_balance_alpha}"
+            f"_beta-{self.beta}_as-{self.alpha_s}"
+            f"_rw-{self.reward_weight}_lr-{self.lr}"
+        )
+        if not self.wandb_run_name:
+            self.wandb_run_name = summary
+        if not self.save_path:
+            self.save_path = f"checkpoints/dreamer_rssm/{summary}"
