@@ -67,7 +67,7 @@ class TransformerSkillEncoder(nn.Module):
         tokens = tokens + self.pos_emb(positions).unsqueeze(0)
 
         out = self.transformer(tokens)  # [B, H, d]
-        last = out[:, -1, :]  # readout from last position
+        last = out[:, -1, :]  # readout from last position since the token has seen all other tokens (technically since this transformer is bidirectional can take any token since all tokens have seen all other tokens)
 
         mean = self.mean_head(last)
         std = self.max_std * torch.sigmoid(self.std_head(last)) + self.min_std
