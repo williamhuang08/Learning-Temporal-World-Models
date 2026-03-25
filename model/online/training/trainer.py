@@ -86,8 +86,11 @@ def _rssm_two_step(rssm, skill_enc, obs_seq, act_seq):
 
 def _state_kl(post, prior):
     """KL divergence averaged over batch and s_dim (DreamerV2 convention)."""
-    return kl_divergence(Normal(*post), Normal(*prior)).mean()
-
+    # return kl_divergence(Normal(*post), Normal(*prior)).mean()
+    kl = kl_divergence(Normal(*post), Normal(*prior)) # [B, s_dim]
+    kl = kl.mean(dim=-1)   # B Kl per sample
+    kl = torch.clamp(kl, min=1.0) # free nats
+    return kl.mean() # avg KL for batch
 
 # ---------------------------------------------------------------------------
 # E-step loss (update RSSM encoder + skill encoder)
@@ -95,12 +98,14 @@ def _state_kl(post, prior):
 
 def get_E_loss(
     batch,
-    rssm, skill_enc, pi_theta, skill_prior,
-    beta, alpha_s,
+    rssm, skill_enc, pi_theta, skill_prior, reward_model,
+    beta, alpha_s, reward_weight,
     kl_balance=False, kl_balance_alpha=0.8,
 ):
     obs_seq = batch["obs_seq"]
     act_seq = batch["act_seq"]
+    goal_xy = batch["goal_xy"]
+    min_goal_dist = batch["min_goal_dist"]
 
     info = _rssm_two_step(rssm, skill_enc, obs_seq, act_seq)
 
@@ -120,12 +125,22 @@ def get_E_loss(
         s1_pr = (info["s1_prior"][0].detach(), info["s1_prior"][1].detach())
     state_kl = (_state_kl(info["s0_post"], s0_pr) + _state_kl(info["s1_post"], s1_pr)) / 2
 
+    # Goal-conditioned min-distance loss — encoders frozen w.r.t. reward head params
+    r_mean, r_std = reward_model(info["s0"], info["z"], goal_xy)
+    reward_loss = -Normal(r_mean, r_std).log_prob(min_goal_dist).mean()
+
     kl_weight = (1 - kl_balance_alpha) if kl_balance else 1.0
-    E_loss = a_loss + kl_weight * beta * skill_kl + kl_weight * alpha_s * state_kl
+    E_loss = (
+        a_loss
+        + kl_weight * beta * skill_kl
+        + kl_weight * alpha_s * state_kl
+        + reward_weight * reward_loss
+    )
     return E_loss, {
         "E/a_loss": a_loss.item(),
         "E/skill_kl": skill_kl.item(),
         "E/state_kl": state_kl.item(),
+        "E/reward_loss": reward_loss.item(),
     }
 
 
@@ -141,7 +156,8 @@ def get_M_loss(
 ):
     obs_seq = batch["obs_seq"]
     act_seq = batch["act_seq"]
-    cum_rew = batch["cumulative_reward"]
+    goal_xy = batch["goal_xy"]
+    min_goal_dist = batch["min_goal_dist"]
 
     with torch.no_grad():
         info = _rssm_two_step(rssm, skill_enc, obs_seq, act_seq)
@@ -170,8 +186,8 @@ def get_M_loss(
     s1_post_det = (info["s1_post"][0].detach(), info["s1_post"][1].detach())
     state_kl = (_state_kl(s0_post_det, s0_prior_g) + _state_kl(s1_post_det, s1_prior_g)) / 2
 
-    r_mean, r_std = reward_model(info["s0"], info["z"])
-    reward_loss = -Normal(r_mean, r_std).log_prob(cum_rew).mean()
+    r_mean, r_std = reward_model(info["s0"], info["z"], goal_xy)
+    reward_loss = -Normal(r_mean, r_std).log_prob(min_goal_dist).mean()
 
     kl_weight = kl_balance_alpha if kl_balance else 1.0
     M_loss = (
@@ -200,7 +216,8 @@ def get_eval_losses(
 ):
     obs_seq = batch["obs_seq"]
     act_seq = batch["act_seq"]
-    cum_rew = batch["cumulative_reward"]
+    goal_xy = batch["goal_xy"]
+    min_goal_dist = batch["min_goal_dist"]
 
     info = _rssm_two_step(rssm, skill_enc, obs_seq, act_seq)
 
@@ -215,8 +232,8 @@ def get_eval_losses(
     state_kl = (_state_kl(info["s0_post"], info["s0_prior"]) +
                 _state_kl(info["s1_post"], info["s1_prior"])) / 2
 
-    r_mean, r_std = reward_model(info["s0"], info["z"])
-    reward_loss = -Normal(r_mean, r_std).log_prob(cum_rew).mean()
+    r_mean, r_std = reward_model(info["s0"], info["z"], goal_xy)
+    reward_loss = -Normal(r_mean, r_std).log_prob(min_goal_dist).mean()
 
     total = a_loss + beta * skill_kl + alpha_s * state_kl + reward_weight * reward_loss
     return total, a_loss, skill_kl, state_kl, reward_loss
@@ -337,6 +354,8 @@ def dreamer_training_with_val(
         for m in all_models:
             m.train()
         e_run = m_run = 0.0
+        e_info_sums = {}
+        m_info_sums = {}
         nb = 0
 
         for batch in train_loader:
@@ -348,8 +367,9 @@ def dreamer_training_with_val(
                 E_optimizer.zero_grad(set_to_none=True)
                 e_loss, e_info = get_E_loss(
                     batch,
-                    rssm, skill_enc, pi_theta, skill_prior,
+                    rssm, skill_enc, pi_theta, skill_prior, reward_model,
                     train_cfg.beta, train_cfg.alpha_s,
+                    train_cfg.reward_weight,
                     train_cfg.kl_balance, train_cfg.kl_balance_alpha,
                 )
                 e_loss.backward()
@@ -357,6 +377,8 @@ def dreamer_training_with_val(
                     nn.utils.clip_grad_norm_(E_params, train_cfg.grad_clip)
                 E_optimizer.step()
             e_run += e_loss.item()
+            for k, v in e_info.items():
+                e_info_sums[k] = e_info_sums.get(k, 0.0) + v
 
             # ---------- M-step ----------
             for _ in range(train_cfg.m_steps):
@@ -373,9 +395,13 @@ def dreamer_training_with_val(
                     nn.utils.clip_grad_norm_(M_params, train_cfg.grad_clip)
                 M_optimizer.step()
             m_run += m_loss.item()
+            for k, v in m_info.items():
+                m_info_sums[k] = m_info_sums.get(k, 0.0) + v
 
         e_epoch = e_run / max(1, nb)
         m_epoch = m_run / max(1, nb)
+        e_info_avg = {k: v / max(1, nb) for k, v in e_info_sums.items()}
+        m_info_avg = {k: v / max(1, nb) for k, v in m_info_sums.items()}
         tr_e.append(e_epoch)
         tr_m.append(m_epoch)
 
@@ -409,19 +435,21 @@ def dreamer_training_with_val(
             f"| val loss:{v_loss:.4f}"
         )
 
-        wandb.log(
-            {
-                "train/E_loss": e_epoch,
-                "train/M_loss": m_epoch,
-                "val/total": val_metrics["total"],
-                "val/a_loss": val_metrics["a"],
-                "val/skill_kl": val_metrics["skill_kl"],
-                "val/state_kl": val_metrics["state_kl"],
-                "val/reward_loss": val_metrics["rew"],
-                "epoch": epoch,
-            },
-            step=epoch,
-        )
+        log_dict = {
+            "train/E_loss": e_epoch,
+            "train/M_loss": m_epoch,
+            "val/total": val_metrics["total"],
+            "val/a_loss": val_metrics["a"],
+            "val/skill_kl": val_metrics["skill_kl"],
+            "val/state_kl": val_metrics["state_kl"],
+            "val/reward_loss": val_metrics["rew"],
+            "epoch": epoch,
+        }
+        for k, v in e_info_avg.items():
+            log_dict[f"train/{k}"] = v
+        for k, v in m_info_avg.items():
+            log_dict[f"train/{k}"] = v
+        wandb.log(log_dict, step=epoch)
 
     # ---- final plot ----
     plt.figure(figsize=(7.5, 4.5))
