@@ -1,11 +1,12 @@
 from dataclasses import dataclass, field
-
+from datetime import date
 
 @dataclass
 class ModelConfig:
     # Environment dimensions
     obs_dim: int = 29
     action_dim: int = 8
+    goal_dim: int = 2        # raw goal (e.g. desired_goal xy) for goal-conditioned reward head
 
     # Latent dimensions
     s_dim: int = 16        # abstract state dimension
@@ -67,6 +68,7 @@ class TrainConfig:
 
     def __post_init__(self):
         summary = (
+            f"{date.today().strftime('%Y-%m-%d')}"
             f"klbal-{self.kl_balance}_alpha-{self.kl_balance_alpha}"
             f"_beta-{self.beta}_as-{self.alpha_s}"
             f"_rw-{self.reward_weight}_lr-{self.lr}"
