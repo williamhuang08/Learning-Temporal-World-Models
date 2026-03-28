@@ -1,15 +1,14 @@
 """
-EM-style Dreamer training for temporally-abstracted skill models
-with an RSSM operating at the abstract temporal level.
+EM-style Dreamer training for temporally-abstracted skill models with a segment
+latent model: start encoder, transformer q(s1|o,a), Markov p(s1|s0,z).
 
-E-step: update RSSM encoder (posterior/trajectory/obs encoder) + skill encoder
-M-step: update RSSM dynamics (GRUCell/prior heads) + skill prior + policy + reward model
+E-step: encoders + observation NLL (grad through decoder into latents; decoder weights updated in M-step)
+M-step: segment dynamics + skill prior + policy + reward model + observation decoder (NLL on detached latents)
 """
 
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.distributions import Normal, kl_divergence
 import matplotlib.pyplot as plt
 import wandb
@@ -49,110 +48,143 @@ def _action_nll(pi_theta, obs_seq, z, act_seq):
     return -torch.sum(a_dist.log_prob(act_seq)) / (B * H)
 
 
-def _rssm_two_step(rssm, skill_enc, obs_seq, act_seq):
+def _segment_latent_forward(start_enc, s1_post_enc, skill_enc, obs_seq, act_seq):
     """
-    Run the two-step RSSM forward pass on a single independent segment.
-
-    Step 0: h_0 = GRUCell(0, [0,0])  →  prior(s_0|h_0), posterior(s_0|h_0,o_0)
-    Step 1: h_1 = GRUCell(h_0,[s_0,z])  →  prior(s_1|h_1), posterior(s_1|h_1,traj)
-
-    Returns dict with all quantities needed for loss computation.
+    Single-segment forward: s0 = f(o0), z ~ q(z|window), s1 ~ q(s1|window),
+    with reparameterized samples for losses that need them.
     """
-    B = obs_seq.size(0)
-    device = obs_seq.device
-
-    h_init, s_init, z_init = rssm.initial_state(B, device)
-
-    # --- step 0: initial abstract state ---
-    obs_context = rssm.encoder.encode_obs(obs_seq[:, 0, :])
-    h0, s0_prior, s0_post = rssm.observe_step(h_init, s_init, z_init, obs_context)
-    s0 = reparameterize(*s0_post)
-
-    # --- skill inference ---
+    s0 = start_enc(obs_seq[:, 0, :])
     z_mean, z_std = skill_enc(obs_seq[:, :-1, :], act_seq)
     z = reparameterize(z_mean, z_std)
-
-    # --- step 1: next abstract state after executing skill ---
-    traj_context = rssm.encoder.encode_trajectory(obs_seq, act_seq)
-    h1, s1_prior, s1_post = rssm.observe_step(h0, s0, z, traj_context)
-
+    s1_mean, s1_std = s1_post_enc(obs_seq, act_seq)
+    s1 = reparameterize(s1_mean, s1_std)
     return {
-        "s0": s0, "z_mean": z_mean, "z_std": z_std, "z": z,
-        "s0_prior": s0_prior, "s0_post": s0_post,
-        "s1_prior": s1_prior, "s1_post": s1_post,
-        "h0": h0, "h1": h1,
+        "s0": s0,
+        "z_mean": z_mean,
+        "z_std": z_std,
+        "z": z,
+        "s1_post": (s1_mean, s1_std),
+        "s1": s1,
     }
 
 
 def _state_kl(post, prior):
-    """KL divergence averaged over batch and s_dim (DreamerV2 convention)."""
-    # return kl_divergence(Normal(*post), Normal(*prior)).mean()
-    kl = kl_divergence(Normal(*post), Normal(*prior)) # [B, s_dim]
-    kl = kl.mean(dim=-1)   # B Kl per sample
-    kl = torch.clamp(kl, min=1.0) # free nats
-    return kl.mean() # avg KL for batch
+    """KL divergence averaged over batch, latent dims, and samples (scalar)."""
+    kl = kl_divergence(Normal(*post), Normal(*prior))  # [B, s_dim]
+    return kl.mean()
+
+
+def _dreamer_kl_clip(kl_scalar, free_nats: float):
+    """Dreamer: L += max(free_nats, KL); gradient vanishes for KL below the floor."""
+    if free_nats <= 0:
+        return kl_scalar
+    return torch.clamp(kl_scalar, min=free_nats)
+
+def _segment_obs_recon_nll(obs_decoder, s0, s1, o0, oH):
+    """Mean NLL for diagonal Gaussian decoders on o_0 and o_H (sum over obs dims)."""
+    mu0, std0 = obs_decoder.forward_o0(s0)
+    nll0 = -Normal(mu0, std0).log_prob(o0).sum(dim=-1).mean()
+    muH, stdH = obs_decoder.forward_oH(s1)
+    nllH = -Normal(muH, stdH).log_prob(oH).sum(dim=-1).mean()
+    return nll0 + nllH
+
+
 
 # ---------------------------------------------------------------------------
-# E-step loss (update RSSM encoder + skill encoder)
+# E-step loss (encoders)
 # ---------------------------------------------------------------------------
 
 def get_E_loss(
     batch,
-    rssm, skill_enc, pi_theta, skill_prior, reward_model,
-    beta, alpha_s, reward_weight,
-    kl_balance=False, kl_balance_alpha=0.8,
+    start_enc,
+    s1_post_enc,
+    segment_dynamics,
+    skill_enc,
+    pi_theta,
+    skill_prior,
+    reward_model,
+    obs_decoder,
+    beta,
+    alpha_s,
+    reward_weight,
+    recon_weight,
+    kl_balance=False,
+    kl_balance_alpha=0.8,
+    free_nats: float = 1.0,
 ):
     obs_seq = batch["obs_seq"]
     act_seq = batch["act_seq"]
     goal_xy = batch["goal_xy"]
     min_goal_dist = batch["min_goal_dist"]
 
-    info = _rssm_two_step(rssm, skill_enc, obs_seq, act_seq)
+    info = _segment_latent_forward(start_enc, s1_post_enc, skill_enc, obs_seq, act_seq)
 
     a_loss = _action_nll(pi_theta, obs_seq, info["z"], act_seq)
 
     # skill KL — posterior side (prior detached)
     with torch.no_grad():
         z_pr_mean, z_pr_std = skill_prior(info["s0"])
-    skill_kl = kl_divergence(
+    skill_kl_raw = kl_divergence(
         Normal(info["z_mean"], info["z_std"]),
         Normal(z_pr_mean, z_pr_std),
     ).mean()
+    skill_kl = _dreamer_kl_clip(skill_kl_raw, free_nats)
 
-    # state KL — posterior side (RSSM dynamics/prior detached)
+    # state KL on s1 only — posterior side (segment dynamics detached)
     with torch.no_grad():
-        s0_pr = (info["s0_prior"][0].detach(), info["s0_prior"][1].detach())
-        s1_pr = (info["s1_prior"][0].detach(), info["s1_prior"][1].detach())
-    state_kl = (_state_kl(info["s0_post"], s0_pr) + _state_kl(info["s1_post"], s1_pr)) / 2
+        z_det = info["z"].detach()
+        mu_p, sig_p = segment_dynamics(info["s0"].detach(), z_det)
+        s1_pr = (mu_p.detach(), sig_p.detach())
+    kl_s1 = _state_kl(info["s1_post"], s1_pr)
+    state_kl = _dreamer_kl_clip(kl_s1, free_nats)
 
-    # Goal-conditioned min-distance loss — encoders frozen w.r.t. reward head params
-    r_mean, r_std = reward_model(info["s0"], info["z"], goal_xy)
-    reward_loss = -Normal(r_mean, r_std).log_prob(min_goal_dist).mean()
+    # r_mean, r_std = reward_model(info["s0"], info["z"].detach(), goal_xy)
+    # reward_loss = -Normal(r_mean, r_std).log_prob(min_goal_dist).mean()
+
+    o0 = obs_seq[:, 0, :]
+    oH = obs_seq[:, -1, :]
+    recon_loss = _segment_obs_recon_nll(
+        obs_decoder, info["s0"], info["s1"], o0, oH
+    )
 
     kl_weight = (1 - kl_balance_alpha) if kl_balance else 1.0
     E_loss = (
         a_loss
         + kl_weight * beta * skill_kl
         + kl_weight * alpha_s * state_kl
-        + reward_weight * reward_loss
+        # + reward_weight * reward_loss
+        + recon_weight * recon_loss
     )
     return E_loss, {
         "E/a_loss": a_loss.item(),
-        "E/skill_kl": skill_kl.item(),
-        "E/state_kl": state_kl.item(),
-        "E/reward_loss": reward_loss.item(),
+        "E/skill_kl": skill_kl_raw.item(),
+        "E/state_kl": kl_s1.item(),
+        # "E/reward_loss": reward_loss.item(),
+        "E/recon_loss": recon_loss.item(),
     }
 
 
 # ---------------------------------------------------------------------------
-# M-step loss (update RSSM dynamics + skill prior + policy + reward model)
+# M-step loss (dynamics + generative heads)
 # ---------------------------------------------------------------------------
 
 def get_M_loss(
     batch,
-    rssm, skill_enc, pi_theta, skill_prior, reward_model,
-    beta, alpha_s, reward_weight,
-    kl_balance=False, kl_balance_alpha=0.8,
+    start_enc,
+    s1_post_enc,
+    segment_dynamics,
+    skill_enc,
+    pi_theta,
+    skill_prior,
+    reward_model,
+    obs_decoder,
+    beta,
+    alpha_s,
+    reward_weight,
+    recon_weight,
+    kl_balance=False,
+    kl_balance_alpha=0.8,
+    free_nats: float = 1.0,
 ):
     obs_seq = batch["obs_seq"]
     act_seq = batch["act_seq"]
@@ -160,34 +192,30 @@ def get_M_loss(
     min_goal_dist = batch["min_goal_dist"]
 
     with torch.no_grad():
-        info = _rssm_two_step(rssm, skill_enc, obs_seq, act_seq)
+        info = _segment_latent_forward(start_enc, s1_post_enc, skill_enc, obs_seq, act_seq)
 
-    # Re-run dynamics with grad so GRUCell + prior heads get gradients,
-    # while encoder outputs (s0, z, posteriors) stay detached.
-    h_init, s_init, z_init = rssm.initial_state(obs_seq.size(0), obs_seq.device)
-
-    h0_dyn, s0_pr_mean, s0_pr_std = rssm.dynamics(h_init, s_init, z_init)
-    s0_prior_g = (s0_pr_mean, s0_pr_std)
-
-    h1_dyn, s1_pr_mean, s1_pr_std = rssm.dynamics(h0_dyn, info["s0"], info["z"])
-    s1_prior_g = (s1_pr_mean, s1_pr_std)
+    s1_post_det = (info["s1_post"][0].detach(), info["s1_post"][1].detach())
+    mu_p, sig_p = segment_dynamics(info["s0"].detach(), info["z"].detach())
+    kl_s1 = _state_kl(s1_post_det, (mu_p, sig_p))
+    state_kl = _dreamer_kl_clip(kl_s1, free_nats)
 
     a_loss = _action_nll(pi_theta, obs_seq, info["z"], act_seq)
 
-    # skill KL — prior side (encoder detached)
     z_pr_mean, z_pr_std = skill_prior(info["s0"])
-    skill_kl = kl_divergence(
+    skill_kl_raw = kl_divergence(
         Normal(info["z_mean"], info["z_std"]),
         Normal(z_pr_mean, z_pr_std),
     ).mean()
-
-    # state KL — prior side (encoder posteriors detached)
-    s0_post_det = (info["s0_post"][0].detach(), info["s0_post"][1].detach())
-    s1_post_det = (info["s1_post"][0].detach(), info["s1_post"][1].detach())
-    state_kl = (_state_kl(s0_post_det, s0_prior_g) + _state_kl(s1_post_det, s1_prior_g)) / 2
+    skill_kl = _dreamer_kl_clip(skill_kl_raw, free_nats)
 
     r_mean, r_std = reward_model(info["s0"], info["z"], goal_xy)
     reward_loss = -Normal(r_mean, r_std).log_prob(min_goal_dist).mean()
+
+    o0 = obs_seq[:, 0, :]
+    oH = obs_seq[:, -1, :]
+    s0_det = info["s0"].detach()
+    s1_det = info["s1_post"][0].detach()
+    recon_loss = _segment_obs_recon_nll(obs_decoder, s0_det, s1_det, o0, oH)
 
     kl_weight = kl_balance_alpha if kl_balance else 1.0
     M_loss = (
@@ -195,12 +223,14 @@ def get_M_loss(
         + kl_weight * beta * skill_kl
         + kl_weight * alpha_s * state_kl
         + reward_weight * reward_loss
+        + recon_weight * recon_loss
     )
     return M_loss, {
         "M/a_loss": a_loss.item(),
-        "M/skill_kl": skill_kl.item(),
-        "M/state_kl": state_kl.item(),
+        "M/skill_kl": skill_kl_raw.item(),
+        "M/state_kl": kl_s1.item(),
         "M/reward_loss": reward_loss.item(),
+        "M/recon_loss": recon_loss.item(),
     }
 
 
@@ -211,15 +241,25 @@ def get_M_loss(
 @torch.no_grad()
 def get_eval_losses(
     batch,
-    rssm, skill_enc, pi_theta, skill_prior, reward_model,
-    beta, alpha_s, reward_weight,
+    start_enc,
+    s1_post_enc,
+    segment_dynamics,
+    skill_enc,
+    pi_theta,
+    skill_prior,
+    reward_model,
+    obs_decoder,
+    beta,
+    alpha_s,
+    reward_weight,
+    recon_weight,
 ):
     obs_seq = batch["obs_seq"]
     act_seq = batch["act_seq"]
     goal_xy = batch["goal_xy"]
     min_goal_dist = batch["min_goal_dist"]
 
-    info = _rssm_two_step(rssm, skill_enc, obs_seq, act_seq)
+    info = _segment_latent_forward(start_enc, s1_post_enc, skill_enc, obs_seq, act_seq)
 
     a_loss = _action_nll(pi_theta, obs_seq, info["z"], act_seq)
 
@@ -229,38 +269,82 @@ def get_eval_losses(
         Normal(z_pr_mean, z_pr_std),
     ).mean()
 
-    state_kl = (_state_kl(info["s0_post"], info["s0_prior"]) +
-                _state_kl(info["s1_post"], info["s1_prior"])) / 2
+    mu_p, sig_p = segment_dynamics(info["s0"], info["z"])
+    state_kl = _state_kl(info["s1_post"], (mu_p, sig_p))
 
     r_mean, r_std = reward_model(info["s0"], info["z"], goal_xy)
     reward_loss = -Normal(r_mean, r_std).log_prob(min_goal_dist).mean()
 
-    total = a_loss + beta * skill_kl + alpha_s * state_kl + reward_weight * reward_loss
-    return total, a_loss, skill_kl, state_kl, reward_loss
+    o0 = obs_seq[:, 0, :]
+    oH = obs_seq[:, -1, :]
+    recon_loss = _segment_obs_recon_nll(
+        obs_decoder, info["s0"], info["s1"], o0, oH
+    )
+
+    total = (
+        a_loss
+        + beta * skill_kl
+        + alpha_s * state_kl
+        + reward_weight * reward_loss
+        + recon_weight * recon_loss
+    )
+    return total, a_loss, skill_kl, state_kl, reward_loss, recon_loss
 
 
 @torch.no_grad()
 def eval_epoch(
     val_loader,
-    rssm, skill_enc, pi_theta, skill_prior, reward_model,
-    beta, alpha_s, reward_weight, device,
+    start_enc,
+    s1_post_enc,
+    segment_dynamics,
+    skill_enc,
+    pi_theta,
+    skill_prior,
+    reward_model,
+    obs_decoder,
+    beta,
+    alpha_s,
+    reward_weight,
+    recon_weight,
+    device,
 ):
-    for m in (rssm, skill_enc, pi_theta, skill_prior, reward_model):
+    for m in (
+        start_enc,
+        s1_post_enc,
+        segment_dynamics,
+        skill_enc,
+        pi_theta,
+        skill_prior,
+        reward_model,
+        obs_decoder,
+    ):
         m.eval()
 
-    sums = dict(total=0.0, a=0.0, skill_kl=0.0, state_kl=0.0, rew=0.0)
+    sums = dict(total=0.0, a=0.0, skill_kl=0.0, state_kl=0.0, rew=0.0, recon=0.0)
     n = 0
     for batch in val_loader:
         batch = {k: v.to(device) for k, v in batch.items()}
-        total, a_loss, skill_kl, state_kl, rew_loss = get_eval_losses(
-            batch, rssm, skill_enc, pi_theta,
-            skill_prior, reward_model, beta, alpha_s, reward_weight,
+        total, a_loss, skill_kl, state_kl, rew_loss, recon_loss = get_eval_losses(
+            batch,
+            start_enc,
+            s1_post_enc,
+            segment_dynamics,
+            skill_enc,
+            pi_theta,
+            skill_prior,
+            reward_model,
+            obs_decoder,
+            beta,
+            alpha_s,
+            reward_weight,
+            recon_weight,
         )
         sums["total"] += total.item()
         sums["a"] += a_loss.item()
         sums["skill_kl"] += skill_kl.item()
         sums["state_kl"] += state_kl.item()
         sums["rew"] += rew_loss.item()
+        sums["recon"] += recon_loss.item()
         n += 1
 
     if n == 0:
@@ -274,17 +358,28 @@ def eval_epoch(
 
 def save_dreamer_checkpoint(
     path,
-    rssm, skill_enc, pi_theta, skill_prior, reward_model,
-    model_cfg, train_cfg,
+    start_enc,
+    s1_post_enc,
+    segment_dynamics,
+    skill_enc,
+    pi_theta,
+    skill_prior,
+    reward_model,
+    obs_decoder,
+    model_cfg,
+    train_cfg,
 ):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(
         {
-            "rssm": rssm.state_dict(),
+            "start_enc": start_enc.state_dict(),
+            "s1_post_enc": s1_post_enc.state_dict(),
+            "segment_dynamics": segment_dynamics.state_dict(),
             "skill_enc": skill_enc.state_dict(),
             "pi_theta": pi_theta.state_dict(),
             "skill_prior": skill_prior.state_dict(),
             "reward_model": reward_model.state_dict(),
+            "obs_decoder": obs_decoder.state_dict(),
             "model_cfg": model_cfg.__dict__,
             "train_cfg": train_cfg.__dict__,
         },
@@ -295,15 +390,28 @@ def save_dreamer_checkpoint(
 
 def load_dreamer_checkpoint(
     path,
-    rssm, skill_enc, pi_theta, skill_prior, reward_model,
+    start_enc,
+    s1_post_enc,
+    segment_dynamics,
+    skill_enc,
+    pi_theta,
+    skill_prior,
+    reward_model,
+    obs_decoder,
     strict=True,
 ):
     ckpt = torch.load(path, weights_only=False, map_location="cpu")
-    rssm.load_state_dict(ckpt["rssm"], strict=strict)
+    start_enc.load_state_dict(ckpt["start_enc"], strict=strict)
+    s1_post_enc.load_state_dict(ckpt["s1_post_enc"], strict=strict)
+    segment_dynamics.load_state_dict(ckpt["segment_dynamics"], strict=strict)
     skill_enc.load_state_dict(ckpt["skill_enc"], strict=strict)
     pi_theta.load_state_dict(ckpt["pi_theta"], strict=strict)
     skill_prior.load_state_dict(ckpt["skill_prior"], strict=strict)
     reward_model.load_state_dict(ckpt["reward_model"], strict=strict)
+    if "obs_decoder" in ckpt:
+        obs_decoder.load_state_dict(ckpt["obs_decoder"], strict=strict)
+    else:
+        print("[checkpoint] no obs_decoder in checkpoint; leaving random init")
     print(f"[checkpoint] loaded <- {path}")
     return ckpt
 
@@ -316,34 +424,44 @@ def dreamer_training_with_val(
     save_path: str,
     train_loader,
     val_loader,
-    # models
-    rssm,
+    start_enc,
+    s1_post_enc,
+    segment_dynamics,
     skill_enc,
     pi_theta,
     skill_prior,
     reward_model,
-    # configs
+    obs_decoder,
     model_cfg: ModelConfig,
     train_cfg: TrainConfig,
     device: str = "cpu",
 ):
-    all_models = [rssm, skill_enc, pi_theta, skill_prior, reward_model]
+    all_models = [
+        start_enc,
+        s1_post_enc,
+        segment_dynamics,
+        skill_enc,
+        pi_theta,
+        skill_prior,
+        reward_model,
+        obs_decoder,
+    ]
     for m in all_models:
         m.to(device)
 
-    # E-optimizer: RSSM encoder (posterior + obs/traj encoder) + skill encoder
     E_params = (
-        list(rssm.encoder_parameters())
+        list(start_enc.parameters())
+        + list(s1_post_enc.parameters())
         + list(skill_enc.parameters())
     )
     E_optimizer = torch.optim.Adam(E_params, lr=train_cfg.lr)
 
-    # M-optimizer: RSSM dynamics (GRUCell + prior heads) + generative models
     M_params = (
-        list(rssm.dynamics_parameters())
+        list(segment_dynamics.parameters())
         + list(pi_theta.parameters())
         + list(skill_prior.parameters())
         + list(reward_model.parameters())
+        + list(obs_decoder.parameters())
     )
     M_optimizer = torch.optim.Adam(M_params, lr=train_cfg.lr)
 
@@ -362,15 +480,25 @@ def dreamer_training_with_val(
             batch = {k: v.to(device) for k, v in batch.items()}
             nb += 1
 
-            # ---------- E-step ----------
             for _ in range(train_cfg.e_steps):
                 E_optimizer.zero_grad(set_to_none=True)
                 e_loss, e_info = get_E_loss(
                     batch,
-                    rssm, skill_enc, pi_theta, skill_prior, reward_model,
-                    train_cfg.beta, train_cfg.alpha_s,
+                    start_enc,
+                    s1_post_enc,
+                    segment_dynamics,
+                    skill_enc,
+                    pi_theta,
+                    skill_prior,
+                    reward_model,
+                    obs_decoder,
+                    train_cfg.beta,
+                    train_cfg.alpha_s,
                     train_cfg.reward_weight,
-                    train_cfg.kl_balance, train_cfg.kl_balance_alpha,
+                    train_cfg.recon_weight,
+                    train_cfg.kl_balance,
+                    train_cfg.kl_balance_alpha,
+                    train_cfg.free_nats,
                 )
                 e_loss.backward()
                 if train_cfg.grad_clip is not None:
@@ -380,15 +508,25 @@ def dreamer_training_with_val(
             for k, v in e_info.items():
                 e_info_sums[k] = e_info_sums.get(k, 0.0) + v
 
-            # ---------- M-step ----------
             for _ in range(train_cfg.m_steps):
                 M_optimizer.zero_grad(set_to_none=True)
                 m_loss, m_info = get_M_loss(
                     batch,
-                    rssm, skill_enc, pi_theta, skill_prior, reward_model,
-                    train_cfg.beta, train_cfg.alpha_s,
+                    start_enc,
+                    s1_post_enc,
+                    segment_dynamics,
+                    skill_enc,
+                    pi_theta,
+                    skill_prior,
+                    reward_model,
+                    obs_decoder,
+                    train_cfg.beta,
+                    train_cfg.alpha_s,
                     train_cfg.reward_weight,
-                    train_cfg.kl_balance, train_cfg.kl_balance_alpha,
+                    train_cfg.recon_weight,
+                    train_cfg.kl_balance,
+                    train_cfg.kl_balance_alpha,
+                    train_cfg.free_nats,
                 )
                 m_loss.backward()
                 if train_cfg.grad_clip is not None:
@@ -405,27 +543,52 @@ def dreamer_training_with_val(
         tr_e.append(e_epoch)
         tr_m.append(m_epoch)
 
-        # periodic checkpoint
         if epoch % train_cfg.checkpoint_every == 0:
             save_dreamer_checkpoint(
                 f"{save_path}/epochs/dreamer_epoch{epoch}.pth",
-                rssm, skill_enc, pi_theta, skill_prior, reward_model,
-                model_cfg, train_cfg,
+                start_enc,
+                s1_post_enc,
+                segment_dynamics,
+                skill_enc,
+                pi_theta,
+                skill_prior,
+                reward_model,
+                obs_decoder,
+                model_cfg,
+                train_cfg,
             )
 
-        # validation
         val_metrics = eval_epoch(
             val_loader,
-            rssm, skill_enc, pi_theta, skill_prior, reward_model,
-            train_cfg.beta, train_cfg.alpha_s, train_cfg.reward_weight, device,
+            start_enc,
+            s1_post_enc,
+            segment_dynamics,
+            skill_enc,
+            pi_theta,
+            skill_prior,
+            reward_model,
+            obs_decoder,
+            train_cfg.beta,
+            train_cfg.alpha_s,
+            train_cfg.reward_weight,
+            train_cfg.recon_weight,
+            device,
         )
         v_loss = val_metrics["total"]
         if v_loss is not None and v_loss < best_val_loss:
             best_val_loss = v_loss
             save_dreamer_checkpoint(
                 f"{save_path}/dreamer_best.pth",
-                rssm, skill_enc, pi_theta, skill_prior, reward_model,
-                model_cfg, train_cfg,
+                start_enc,
+                s1_post_enc,
+                segment_dynamics,
+                skill_enc,
+                pi_theta,
+                skill_prior,
+                reward_model,
+                obs_decoder,
+                model_cfg,
+                train_cfg,
             )
         va.append(v_loss)
 
@@ -443,6 +606,7 @@ def dreamer_training_with_val(
             "val/skill_kl": val_metrics["skill_kl"],
             "val/state_kl": val_metrics["state_kl"],
             "val/reward_loss": val_metrics["rew"],
+            "val/recon_loss": val_metrics["recon"],
             "epoch": epoch,
         }
         for k, v in e_info_avg.items():
@@ -451,7 +615,6 @@ def dreamer_training_with_val(
             log_dict[f"train/{k}"] = v
         wandb.log(log_dict, step=epoch)
 
-    # ---- final plot ----
     plt.figure(figsize=(7.5, 4.5))
     plt.plot(tr_e, label="Train E loss")
     plt.plot(tr_m, label="Train M loss")
