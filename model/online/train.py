@@ -1,5 +1,5 @@
 """
-Training script for the Dreamer-style RSSM with temporally-abstracted skills.
+Training script for the Dreamer-style segment latent model with temporally-abstracted skills.
 
 Usage:
     python -m model.online.train
@@ -16,7 +16,15 @@ import wandb
 from torch.utils.data import DataLoader
 
 from model.online.training.config import ModelConfig, TrainConfig
-from model.online.models import AbstractRSSM, TransformerSkillEncoder, RewardModel, AbstractSkillPrior
+from model.online.models import (
+    SegmentObservationDecoder,
+    StartStateEncoder,
+    StatePosteriorTransformer,
+    SegmentDynamics,
+    TransformerSkillEncoder,
+    RewardModel,
+    AbstractSkillPrior,
+)
 from model.online.models.ll_policy import SkillPolicy
 from model.online.utils.buffer import DreamerSubtrajDataset, dreamer_collate, compute_stats
 from model.online.utils.buffer import make_episode_splits
@@ -24,7 +32,7 @@ from model.online.training.trainer import dreamer_training_with_val
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train Dreamer RSSM + skills")
+    parser = argparse.ArgumentParser(description="Train Dreamer segment latent model + skills")
 
     # model
     parser.add_argument("--obs_dim", type=int, default=ModelConfig.obs_dim)
@@ -33,18 +41,23 @@ def parse_args():
     parser.add_argument("--z_dim", type=int, default=ModelConfig.z_dim)
     parser.add_argument("--h_dim", type=int, default=ModelConfig.h_dim)
     parser.add_argument("--H", type=int, default=ModelConfig.H)
-    parser.add_argument("--rssm_h_dim", type=int, default=ModelConfig.rssm_h_dim)
     parser.add_argument("--d_model", type=int, default=ModelConfig.d_model)
     parser.add_argument("--n_heads", type=int, default=ModelConfig.n_heads)
     parser.add_argument("--n_layers", type=int, default=ModelConfig.n_layers)
     parser.add_argument("--dropout", type=float, default=ModelConfig.dropout)
+    parser.add_argument("--goal_dim", type=int, default=ModelConfig.goal_dim,
+                        help="Raw goal dimension for reward head (AntMaze xy=2)")
 
     # training
     parser.add_argument("--beta", type=float, default=TrainConfig.beta)
     parser.add_argument("--alpha_s", type=float, default=TrainConfig.alpha_s)
     parser.add_argument("--reward_weight", type=float, default=TrainConfig.reward_weight)
-    parser.add_argument("--kl_balance", action="store_true", default=TrainConfig.kl_balance)
+    parser.add_argument("--recon_weight", type=float, default=TrainConfig.recon_weight,
+                        help="Weight on Gaussian NLL for decoding o_0 and o_H from s_0,s_1")
+    parser.add_argument("--kl_balance", action=argparse.BooleanOptionalAction, default=TrainConfig.kl_balance)
     parser.add_argument("--kl_balance_alpha", type=float, default=TrainConfig.kl_balance_alpha)
+    parser.add_argument("--free_nats", type=float, default=TrainConfig.free_nats,
+                        help="Dreamer KL floor for training (max(free_nats,KL)); 0 disables")
     parser.add_argument("--lr", type=float, default=TrainConfig.lr)
     parser.add_argument("--grad_clip", type=float, default=TrainConfig.grad_clip)
     parser.add_argument("--e_steps", type=int, default=TrainConfig.e_steps)
@@ -63,7 +76,7 @@ def parse_args():
     # logging / infra
     parser.add_argument("--wandb_project", type=str, default=TrainConfig.wandb_project)
     parser.add_argument("--wandb_run_name", type=str, default=TrainConfig.wandb_run_name)
-    parser.add_argument("--save_path", type=str, default="checkpoints/dreamer_rssm")
+    parser.add_argument("--save_path", type=str, default="")
     parser.add_argument("--normalize_obs", action="store_true",
                         help="Normalize observations with per-feature mean/std")
     parser.add_argument("--device", type=str, default=None,
@@ -91,18 +104,20 @@ def main():
         z_dim=args.z_dim,
         h_dim=args.h_dim,
         H=args.H,
-        rssm_h_dim=args.rssm_h_dim,
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         dropout=args.dropout,
+        goal_dim=args.goal_dim,
     )
     train_cfg = TrainConfig(
         beta=args.beta,
         alpha_s=args.alpha_s,
         reward_weight=args.reward_weight,
+        recon_weight=args.recon_weight,
         kl_balance=args.kl_balance,
         kl_balance_alpha=args.kl_balance_alpha,
+        free_nats=args.free_nats,
         lr=args.lr,
         grad_clip=args.grad_clip,
         e_steps=args.e_steps,
@@ -117,6 +132,7 @@ def main():
         seed=args.seed,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
+        save_path=args.save_path,
     )
 
     # --- dataset ---
@@ -158,14 +174,18 @@ def main():
     )
 
     # --- models ---
-    rssm = AbstractRSSM(
+    start_enc = StartStateEncoder(obs_dim=model_cfg.obs_dim, s_dim=model_cfg.s_dim) # s0 encoder
+    s1_post_enc = StatePosteriorTransformer( # s1 encoders
         obs_dim=model_cfg.obs_dim,
         action_dim=model_cfg.action_dim,
         s_dim=model_cfg.s_dim,
-        z_dim=model_cfg.z_dim,
-        h_dim=model_cfg.rssm_h_dim,
+        d_model=model_cfg.d_model,
+        n_heads=model_cfg.n_heads,
+        n_layers=model_cfg.n_layers,
+        dropout=model_cfg.dropout,
     )
-    skill_enc = TransformerSkillEncoder(
+    segment_dynamics = SegmentDynamics(s_dim=model_cfg.s_dim, z_dim=model_cfg.z_dim) # TAWM
+    skill_enc = TransformerSkillEncoder( # z0
         obs_dim=model_cfg.obs_dim,
         action_dim=model_cfg.action_dim,
         z_dim=model_cfg.z_dim,
@@ -174,7 +194,7 @@ def main():
         n_layers=model_cfg.n_layers,
         dropout=model_cfg.dropout,
     )
-    skill_prior = AbstractSkillPrior(
+    skill_prior = AbstractSkillPrior( # \hat{z0}
         s_dim=model_cfg.s_dim,
         z_dim=model_cfg.z_dim,
         h_dim=model_cfg.h_dim,
@@ -182,23 +202,40 @@ def main():
     reward_model = RewardModel(
         s_dim=model_cfg.s_dim,
         z_dim=model_cfg.z_dim,
+        goal_dim=model_cfg.goal_dim,
         h_dim=model_cfg.h_dim,
     )
-    pi_theta = SkillPolicy(
+    pi_theta = SkillPolicy( # ll policy
         state_dim=model_cfg.obs_dim,
         action_dim=model_cfg.action_dim,
+    )
+    obs_decoder = SegmentObservationDecoder( # o0, oH
+        obs_dim=model_cfg.obs_dim,
+        s_dim=model_cfg.s_dim,
+        h_dim=model_cfg.h_dim,
     )
 
     total_params = sum(
         sum(p.numel() for p in m.parameters())
-        for m in [rssm, skill_enc, skill_prior, reward_model, pi_theta]
+        for m in [
+            start_enc,
+            s1_post_enc,
+            segment_dynamics,
+            skill_enc,
+            skill_prior,
+            reward_model,
+            pi_theta,
+            obs_decoder,
+        ]
     )
     print(f"\nTotal parameters: {total_params:,}")
-    print(f"  RSSM dynamics:  {sum(p.numel() for p in rssm.dynamics_parameters()):,}")
-    print(f"  RSSM encoder:   {sum(p.numel() for p in rssm.encoder_parameters()):,}")
-    print(f"  Skill encoder:  {sum(p.numel() for p in skill_enc.parameters()):,}")
+    print(f"  Start encoder:        {sum(p.numel() for p in start_enc.parameters()):,}")
+    print(f"  s1 posterior (TF):    {sum(p.numel() for p in s1_post_enc.parameters()):,}")
+    print(f"  Segment dynamics:     {sum(p.numel() for p in segment_dynamics.parameters()):,}")
+    print(f"  Skill encoder:        {sum(p.numel() for p in skill_enc.parameters()):,}")
     print(f"  Skill prior:    {sum(p.numel() for p in skill_prior.parameters()):,}")
     print(f"  Reward model:   {sum(p.numel() for p in reward_model.parameters()):,}")
+    print(f"  Obs decoder:    {sum(p.numel() for p in obs_decoder.parameters()):,}")
     print(f"  Policy:         {sum(p.numel() for p in pi_theta.parameters()):,}")
 
     # --- wandb ---
@@ -211,14 +248,17 @@ def main():
     # --- train ---
     print(f"\nStarting training for {train_cfg.epochs} epochs...")
     history = dreamer_training_with_val(
-        save_path=args.save_path,
+        save_path=train_cfg.save_path,
         train_loader=train_loader,
         val_loader=val_loader,
-        rssm=rssm,
+        start_enc=start_enc,
+        s1_post_enc=s1_post_enc,
+        segment_dynamics=segment_dynamics,
         skill_enc=skill_enc,
         pi_theta=pi_theta,
         skill_prior=skill_prior,
         reward_model=reward_model,
+        obs_decoder=obs_decoder,
         model_cfg=model_cfg,
         train_cfg=train_cfg,
         device=device,
