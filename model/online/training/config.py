@@ -19,7 +19,7 @@ class ModelConfig:
     # RSSM (deterministic hidden state dimension)
     rssm_h_dim: int = 256
 
-    # Skill encoder (Transformer)
+    # Skill and state encoder (Transformer)
     d_model: int = 256
     n_heads: int = 4
     n_layers: int = 4
@@ -35,10 +35,13 @@ class TrainConfig:
     beta: float = 1.0          # skill KL weight
     alpha_s: float = 0.1       # state KL weight
     reward_weight: float = 1.0
+    recon_weight: float = 1.0  # NLL on o_0, o_H from SegmentObservationDecoder
 
     # KL balancing (DreamerV2-style)
     kl_balance: bool = True
     kl_balance_alpha: float = 0.8
+    # Dreamer-style free nats: train loss uses max(free_nats, KL) per KL term. <=0 disables.
+    free_nats: float = 1.0
 
     # Optimiser
     lr: float = 2e-5
@@ -69,7 +72,7 @@ class TrainConfig:
     def __post_init__(self):
         summary = (
             f"{date.today().strftime('%Y-%m-%d')}"
-            f"klbal-{self.kl_balance}_alpha-{self.kl_balance_alpha}"
+            f"_klbal-{self.kl_balance}_alpha-{self.kl_balance_alpha}"
             f"_beta-{self.beta}_as-{self.alpha_s}"
             f"_rw-{self.reward_weight}_lr-{self.lr}"
         )
