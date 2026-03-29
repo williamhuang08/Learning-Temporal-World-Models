@@ -32,13 +32,21 @@ class SegmentObservationDecoder(nn.Module):
             nn.Linear(h_dim, h_dim),
             nn.ReLU(),
         )
-        self.o0_mean = nn.Linear(h_dim, obs_dim)
+        self.o0_mean = nn.Sequential(
+            nn.Linear(h_dim, h_dim),
+            nn.ReLU(),
+            nn.Linear(h_dim, obs_dim),
+        )
         self.o0_std = nn.Sequential(
             nn.Linear(h_dim, h_dim),
             nn.ReLU(),
             nn.Linear(h_dim, obs_dim),
         )
-        self.oH_mean = nn.Linear(h_dim, obs_dim)
+        self.oH_mean = nn.Sequential(
+            nn.Linear(h_dim, h_dim),
+            nn.ReLU(),
+            nn.Linear(h_dim, obs_dim),
+        )
         self.oH_std = nn.Sequential(
             nn.Linear(h_dim, h_dim),
             nn.ReLU(),
