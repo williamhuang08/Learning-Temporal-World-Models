@@ -70,8 +70,8 @@ def _segment_latent_forward(start_enc, s1_post_enc, skill_enc, obs_seq, act_seq)
 
 def _state_kl(post, prior):
     """KL divergence averaged over batch, latent dims, and samples (scalar)."""
-    kl = kl_divergence(Normal(*post), Normal(*prior))  # [B, s_dim]
-    return kl.mean()
+    kl = torch.mean(torch.sum(kl_divergence(Normal(*post), Normal(*prior)), dim=-1)) # [B, s_dim]
+    return kl
 
 
 def _dreamer_kl_clip(kl_scalar, free_nats: float):
@@ -80,12 +80,12 @@ def _dreamer_kl_clip(kl_scalar, free_nats: float):
         return kl_scalar
     return torch.clamp(kl_scalar, min=free_nats)
 
-def _segment_obs_recon_nll(obs_decoder, s0, s1, o0, oH):
+def _segment_obs_recon_nll(obs_decoder, s0, s1, o0, oH, T):
     """Mean NLL for diagonal Gaussian decoders on o_0 and o_H (sum over obs dims)."""
     mu0, std0 = obs_decoder.forward_o0(s0)
-    nll0 = -Normal(mu0, std0).log_prob(o0).sum(dim=-1).mean()
+    nll0 = -torch.mean(torch.sum(Normal(mu0, std0).log_prob(o0), dim=-1)) / T
     muH, stdH = obs_decoder.forward_oH(s1)
-    nllH = -Normal(muH, stdH).log_prob(oH).sum(dim=-1).mean()
+    nllH = -torch.mean(torch.sum(Normal(muH, stdH).log_prob(oH), dim=-1)) / T
     return nll0 + nllH
 
 
@@ -93,6 +93,103 @@ def _segment_obs_recon_nll(obs_decoder, s0, s1, o0, oH):
 # ---------------------------------------------------------------------------
 # E-step loss (encoders)
 # ---------------------------------------------------------------------------
+
+# def get_E_loss(
+#     batch,
+#     start_enc,
+#     s1_post_enc,
+#     segment_dynamics,
+#     skill_enc,
+#     pi_theta,
+#     skill_prior,
+#     reward_model,
+#     obs_decoder,
+#     beta,
+#     alpha_s,
+#     reward_weight,
+#     recon_weight,
+#     kl_balance=False,
+#     kl_balance_alpha=0.8,
+#     free_nats: float = 1.0,
+# ):
+#     obs_seq = batch["obs_seq"]
+#     act_seq = batch["act_seq"]
+#     goal_xy = batch["goal_xy"]
+#     min_goal_dist = batch["min_goal_dist"]
+
+#     B, T, _ = obs_seq.shape
+#     denom = B * T
+
+#     info = _segment_latent_forward(start_enc, s1_post_enc, skill_enc, obs_seq, act_seq)
+
+#     a_loss = _action_nll(pi_theta, obs_seq, info["z"], act_seq)
+
+#     if kl_balance:
+#         # skill KL — posterior side (prior detached)
+#         with torch.no_grad():
+#             z_pr_mean, z_pr_std = skill_prior(info["s0"])
+#         skill_kl_raw = kl_divergence(
+#             Normal(info["z_mean"], info["z_std"]),
+#             Normal(z_pr_mean, z_pr_std),
+#         ).mean()
+#         skill_kl = _dreamer_kl_clip(skill_kl_raw, free_nats)
+
+#         # state KL on s1 only — posterior side (segment dynamics detached)
+#         with torch.no_grad():
+#             z_det = info["z"].detach()
+#             mu_p, sig_p = segment_dynamics(info["s0"].detach(), z_det)
+#             s1_pr = (mu_p.detach(), sig_p.detach())
+#         kl_s1 = _state_kl(info["s1_post"], s1_pr)
+#         state_kl = _dreamer_kl_clip(kl_s1, free_nats)
+#     else:
+#         z_pr_mean, z_pr_std = skill_prior(info["s0"])
+#         prior_dist = Normal(z_pr_mean, z_pr_std)
+#         post_dist = Normal(info["z_mean"], info["z_std"])
+#         log_prior = torch.sum(prior_dist.log_prob(info["z"])) / denom
+#         log_post = torch.sum(post_dist.log_prob(info["z"])) / denom
+#         skill_kl_raw = -log_prior + log_post
+#         skill_kl = _dreamer_kl_clip(skill_kl_raw, free_nats)
+
+#         z_det = info["z"].detach()
+#         mu_p, sig_p = segment_dynamics(info["s0"].detach(), z_det)
+#         s1_pr = (mu_p.detach(), sig_p.detach())
+#         kl_s1 = _state_kl(info["s1_post"], s1_pr)
+#         state_kl = _dreamer_kl_clip(kl_s1, free_nats)
+
+
+#     # r_mean, r_std = reward_model(info["s0"], info["z"].detach(), goal_xy)
+#     # reward_loss = -Normal(r_mean, r_std).log_prob(min_goal_dist).mean()
+
+#     o0 = obs_seq[:, 0, :]
+#     oH = obs_seq[:, -1, :]
+#     recon_loss = _segment_obs_recon_nll(
+#         obs_decoder, info["s0"], info["s1"], o0, oH
+#     )
+
+#     kl_weight = (1 - kl_balance_alpha) if kl_balance else 1.0
+#     if kl_balance:
+#         E_loss = (
+#             a_loss
+#             + kl_weight * beta * skill_kl
+#             + kl_weight * alpha_s * state_kl
+#             # + reward_weight * reward_loss
+#             + recon_weight * recon_loss
+#         )
+#     else:
+#         E_loss = (
+#             a_loss
+#             + beta * skill_kl
+#             # + alpha_s * state_kl
+#             # + reward_weight * reward_loss
+#             + recon_weight * recon_loss
+#         )
+#     return E_loss, {
+#         "E/a_loss": a_loss.item(),
+#         "E/skill_kl": skill_kl_raw.item(),
+#         "E/state_kl": kl_s1.item(),
+#         # "E/reward_loss": reward_loss.item(),
+#         "E/recon_loss": recon_loss.item(),
+#     }
 
 def get_E_loss(
     batch,
@@ -114,59 +211,131 @@ def get_E_loss(
 ):
     obs_seq = batch["obs_seq"]
     act_seq = batch["act_seq"]
-    goal_xy = batch["goal_xy"]
-    min_goal_dist = batch["min_goal_dist"]
+    B, T, _ = obs_seq.shape
+    denom = B * T
 
     info = _segment_latent_forward(start_enc, s1_post_enc, skill_enc, obs_seq, act_seq)
 
+    # Action likelihood term: lets q(z|tau) match the action-explaining skill posterior
     a_loss = _action_nll(pi_theta, obs_seq, info["z"], act_seq)
 
-    # skill KL — posterior side (prior detached)
-    with torch.no_grad():
-        z_pr_mean, z_pr_std = skill_prior(info["s0"])
-    skill_kl_raw = kl_divergence(
-        Normal(info["z_mean"], info["z_std"]),
-        Normal(z_pr_mean, z_pr_std),
-    ).mean()
-    skill_kl = _dreamer_kl_clip(skill_kl_raw, free_nats)
+    if kl_balance:
+        # Skill KL — posterior side only, prior detached
+        with torch.no_grad():
+            z_pr_mean, z_pr_std = skill_prior(info["s0"])
+        skill_kl_raw = kl_divergence(
+            Normal(info["z_mean"], info["z_std"]),
+            Normal(z_pr_mean, z_pr_std),
+        ).mean()
+        skill_kl = _dreamer_kl_clip(skill_kl_raw, free_nats)
 
-    # state KL on s1 only — posterior side (segment dynamics detached)
-    with torch.no_grad():
-        z_det = info["z"].detach()
-        mu_p, sig_p = segment_dynamics(info["s0"].detach(), z_det)
-        s1_pr = (mu_p.detach(), sig_p.detach())
-    kl_s1 = _state_kl(info["s1_post"], s1_pr)
-    state_kl = _dreamer_kl_clip(kl_s1, free_nats)
+        # State KL on s1 only — posterior side only, dynamics detached
+        with torch.no_grad():
+            mu_p, sig_p = segment_dynamics(info["s0"].detach(), info["z"].detach())
+        kl_s1 = _state_kl(info["s1_post"], (mu_p.detach(), sig_p.detach()))
+        state_kl = _dreamer_kl_clip(kl_s1, free_nats)
 
-    # r_mean, r_std = reward_model(info["s0"], info["z"].detach(), goal_xy)
-    # reward_loss = -Normal(r_mean, r_std).log_prob(min_goal_dist).mean()
+        kl_weight = 1.0 - kl_balance_alpha
+        E_loss = (
+            a_loss
+            + kl_weight * beta * skill_kl
+            + kl_weight * alpha_s * state_kl
+        )
+    else:
+        # No KL balancing: just use the standard analytic KLs
+        with torch.no_grad():
+            z_pr_mean, z_pr_std = skill_prior(info["s0"])
+            mu_p, sig_p = segment_dynamics(info["s0"], info["z"])
 
-    o0 = obs_seq[:, 0, :]
-    oH = obs_seq[:, -1, :]
-    recon_loss = _segment_obs_recon_nll(
-        obs_decoder, info["s0"], info["s1"], o0, oH
-    )
+        # skill_kl_raw = kl_divergence(
+        #     Normal(info["z_mean"], info["z_std"]),
+        #     Normal(z_pr_mean, z_pr_std),
+        # ).mean()
+        skill_kl_raw = torch.mean(torch.sum(kl_divergence(Normal(info["z_mean"], info["z_std"]), Normal(z_pr_mean, z_pr_std)), dim=-1)) / T
+        skill_kl = _dreamer_kl_clip(skill_kl_raw, free_nats)
 
-    kl_weight = (1 - kl_balance_alpha) if kl_balance else 1.0
-    E_loss = (
-        a_loss
-        + kl_weight * beta * skill_kl
-        + kl_weight * alpha_s * state_kl
-        # + reward_weight * reward_loss
-        + recon_weight * recon_loss
-    )
+        kl_s1 = _state_kl(info["s1_post"], (mu_p, sig_p)) / T
+        state_kl = _dreamer_kl_clip(kl_s1, free_nats)
+
+        E_loss = (
+            a_loss
+            + beta * skill_kl
+            + alpha_s * state_kl
+        )
+
     return E_loss, {
         "E/a_loss": a_loss.item(),
         "E/skill_kl": skill_kl_raw.item(),
         "E/state_kl": kl_s1.item(),
-        # "E/reward_loss": reward_loss.item(),
-        "E/recon_loss": recon_loss.item(),
     }
-
-
 # ---------------------------------------------------------------------------
 # M-step loss (dynamics + generative heads)
 # ---------------------------------------------------------------------------
+
+# def get_M_loss(
+#     batch,
+#     start_enc,
+#     s1_post_enc,
+#     segment_dynamics,
+#     skill_enc,
+#     pi_theta,
+#     skill_prior,
+#     reward_model,
+#     obs_decoder,
+#     beta,
+#     alpha_s,
+#     reward_weight,
+#     recon_weight,
+#     kl_balance=False,
+#     kl_balance_alpha=0.8,
+#     free_nats: float = 1.0,
+# ):
+#     obs_seq = batch["obs_seq"]
+#     act_seq = batch["act_seq"]
+#     goal_xy = batch["goal_xy"]
+#     min_goal_dist = batch["min_goal_dist"]
+
+#     with torch.no_grad():
+#         info = _segment_latent_forward(start_enc, s1_post_enc, skill_enc, obs_seq, act_seq)
+
+#     s1_post_det = (info["s1_post"][0].detach(), info["s1_post"][1].detach())
+#     mu_p, sig_p = segment_dynamics(info["s0"].detach(), info["z"].detach())
+#     kl_s1 = _state_kl(s1_post_det, (mu_p, sig_p))
+#     state_kl = _dreamer_kl_clip(kl_s1, free_nats)
+
+#     a_loss = _action_nll(pi_theta, obs_seq, info["z"], act_seq)
+
+#     z_pr_mean, z_pr_std = skill_prior(info["s0"])
+#     skill_kl_raw = kl_divergence(
+#         Normal(info["z_mean"], info["z_std"]),
+#         Normal(z_pr_mean, z_pr_std),
+#     ).mean()
+#     skill_kl = _dreamer_kl_clip(skill_kl_raw, free_nats)
+
+#     r_mean, r_std = reward_model(info["s0"], info["z"], goal_xy)
+#     reward_loss = -Normal(r_mean, r_std).log_prob(min_goal_dist).mean()
+
+#     o0 = obs_seq[:, 0, :]
+#     oH = obs_seq[:, -1, :]
+#     s0_det = info["s0"].detach()
+#     s1_det = info["s1_post"][0].detach()
+#     recon_loss = _segment_obs_recon_nll(obs_decoder, s0_det, s1_det, o0, oH)
+
+#     kl_weight = kl_balance_alpha if kl_balance else 1.0
+#     M_loss = (
+#         a_loss
+#         + kl_weight * beta * skill_kl
+#         + kl_weight * alpha_s * state_kl
+#         + reward_weight * reward_loss
+#         + recon_weight * recon_loss
+#     )
+#     return M_loss, {
+#         "M/a_loss": a_loss.item(),
+#         "M/skill_kl": skill_kl_raw.item(),
+#         "M/state_kl": kl_s1.item(),
+#         "M/reward_loss": reward_loss.item(),
+#         "M/recon_loss": recon_loss.item(),
+#     }
 
 def get_M_loss(
     batch,
@@ -190,53 +359,107 @@ def get_M_loss(
     act_seq = batch["act_seq"]
     goal_xy = batch["goal_xy"]
     min_goal_dist = batch["min_goal_dist"]
+    B, T, _ = obs_seq.shape
+    denom = B * T
 
     with torch.no_grad():
         info = _segment_latent_forward(start_enc, s1_post_enc, skill_enc, obs_seq, act_seq)
 
-    s1_post_det = (info["s1_post"][0].detach(), info["s1_post"][1].detach())
-    mu_p, sig_p = segment_dynamics(info["s0"].detach(), info["z"].detach())
-    kl_s1 = _state_kl(s1_post_det, (mu_p, sig_p))
-    state_kl = _dreamer_kl_clip(kl_s1, free_nats)
-
     a_loss = _action_nll(pi_theta, obs_seq, info["z"], act_seq)
 
     z_pr_mean, z_pr_std = skill_prior(info["s0"])
-    skill_kl_raw = kl_divergence(
-        Normal(info["z_mean"], info["z_std"]),
-        Normal(z_pr_mean, z_pr_std),
-    ).mean()
-    skill_kl = _dreamer_kl_clip(skill_kl_raw, free_nats)
+    prior_dist = Normal(z_pr_mean, z_pr_std)
+    skill_prior_loss = -torch.mean(torch.sum(prior_dist.log_prob(info["z"]), dim=-1)) / T
+
+    mu_p, sig_p = segment_dynamics(info["s0"], info["z"])
+    s1_prior_dist = Normal(mu_p, sig_p)
+    state_prior_loss = -torch.mean(torch.sum(s1_prior_dist.log_prob(info["s1"]), dim=-1)) / T
 
     r_mean, r_std = reward_model(info["s0"], info["z"], goal_xy)
-    reward_loss = -Normal(r_mean, r_std).log_prob(min_goal_dist).mean()
+    reward_loss = -Normal(r_mean, r_std).log_prob(min_goal_dist).mean() / T
 
     o0 = obs_seq[:, 0, :]
     oH = obs_seq[:, -1, :]
-    s0_det = info["s0"].detach()
-    s1_det = info["s1_post"][0].detach()
-    recon_loss = _segment_obs_recon_nll(obs_decoder, s0_det, s1_det, o0, oH)
+    recon_loss = _segment_obs_recon_nll(
+        obs_decoder,
+        info["s0"].detach(),
+        info["s1"].detach(),
+        o0,
+        oH,
+        T
+    )
 
-    kl_weight = kl_balance_alpha if kl_balance else 1.0
     M_loss = (
         a_loss
-        + kl_weight * beta * skill_kl
-        + kl_weight * alpha_s * state_kl
+        + beta * skill_prior_loss
+        + alpha_s * state_prior_loss
         + reward_weight * reward_loss
         + recon_weight * recon_loss
     )
+
     return M_loss, {
         "M/a_loss": a_loss.item(),
-        "M/skill_kl": skill_kl_raw.item(),
-        "M/state_kl": kl_s1.item(),
+        "M/skill_prior_loss": skill_prior_loss.item(),
+        "M/state_prior_loss": state_prior_loss.item(),
         "M/reward_loss": reward_loss.item(),
         "M/recon_loss": recon_loss.item(),
     }
 
-
 # ---------------------------------------------------------------------------
 # Evaluation (full KL, no EM detaching)
 # ---------------------------------------------------------------------------
+
+# @torch.no_grad()
+# def get_eval_losses(
+#     batch,
+#     start_enc,
+#     s1_post_enc,
+#     segment_dynamics,
+#     skill_enc,
+#     pi_theta,
+#     skill_prior,
+#     reward_model,
+#     obs_decoder,
+#     beta,
+#     alpha_s,
+#     reward_weight,
+#     recon_weight,
+# ):
+#     obs_seq = batch["obs_seq"]
+#     act_seq = batch["act_seq"]
+#     goal_xy = batch["goal_xy"]
+#     min_goal_dist = batch["min_goal_dist"]
+
+#     info = _segment_latent_forward(start_enc, s1_post_enc, skill_enc, obs_seq, act_seq)
+
+#     a_loss = _action_nll(pi_theta, obs_seq, info["z"], act_seq)
+
+#     z_pr_mean, z_pr_std = skill_prior(info["s0"])
+#     skill_kl = kl_divergence(
+#         Normal(info["z_mean"], info["z_std"]),
+#         Normal(z_pr_mean, z_pr_std),
+#     ).mean()
+
+#     mu_p, sig_p = segment_dynamics(info["s0"], info["z"])
+#     state_kl = _state_kl(info["s1_post"], (mu_p, sig_p))
+
+#     r_mean, r_std = reward_model(info["s0"], info["z"], goal_xy)
+#     reward_loss = -Normal(r_mean, r_std).log_prob(min_goal_dist).mean()
+
+#     o0 = obs_seq[:, 0, :]
+#     oH = obs_seq[:, -1, :]
+#     recon_loss = _segment_obs_recon_nll(
+#         obs_decoder, info["s0"], info["s1"], o0, oH
+#     )
+
+#     total = (
+#         a_loss
+#         + beta * skill_kl
+#         + alpha_s * state_kl
+#         + reward_weight * reward_loss
+#         + recon_weight * recon_loss
+#     )
+#     return total, a_loss, skill_kl, state_kl, reward_loss, recon_loss
 
 @torch.no_grad()
 def get_eval_losses(
@@ -259,26 +482,36 @@ def get_eval_losses(
     goal_xy = batch["goal_xy"]
     min_goal_dist = batch["min_goal_dist"]
 
+    B, T, _ = obs_seq.shape
+    denom = B * T
+
     info = _segment_latent_forward(start_enc, s1_post_enc, skill_enc, obs_seq, act_seq)
 
     a_loss = _action_nll(pi_theta, obs_seq, info["z"], act_seq)
 
     z_pr_mean, z_pr_std = skill_prior(info["s0"])
-    skill_kl = kl_divergence(
-        Normal(info["z_mean"], info["z_std"]),
-        Normal(z_pr_mean, z_pr_std),
-    ).mean()
+    # skill_kl = kl_divergence(
+    #     Normal(info["z_mean"], info["z_std"]),
+    #     Normal(z_pr_mean, z_pr_std),
+    # ).mean()
+    skill_kl = torch.mean(torch.sum(kl_divergence(Normal(info["z_mean"], info["z_std"]), Normal(z_pr_mean, z_pr_std)), dim=-1)) / T
+
 
     mu_p, sig_p = segment_dynamics(info["s0"], info["z"])
-    state_kl = _state_kl(info["s1_post"], (mu_p, sig_p))
+    state_kl = _state_kl(info["s1_post"], (mu_p, sig_p)) / T
 
     r_mean, r_std = reward_model(info["s0"], info["z"], goal_xy)
-    reward_loss = -Normal(r_mean, r_std).log_prob(min_goal_dist).mean()
+    reward_loss = -Normal(r_mean, r_std).log_prob(min_goal_dist).mean() / T
 
     o0 = obs_seq[:, 0, :]
     oH = obs_seq[:, -1, :]
     recon_loss = _segment_obs_recon_nll(
-        obs_decoder, info["s0"], info["s1"], o0, oH
+        obs_decoder,
+        info["s0"],
+        info["s1_post"][0],   # use posterior mean for consistency
+        o0,
+        oH,
+        T
     )
 
     total = (
@@ -289,7 +522,6 @@ def get_eval_losses(
         + recon_weight * recon_loss
     )
     return total, a_loss, skill_kl, state_kl, reward_loss, recon_loss
-
 
 @torch.no_grad()
 def eval_epoch(
