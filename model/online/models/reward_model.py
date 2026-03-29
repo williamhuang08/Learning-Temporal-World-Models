@@ -31,8 +31,18 @@ class RewardModel(nn.Module):
             nn.Linear(h_dim, h_dim),
             nn.ReLU(),
         )
-        self.mean_head = nn.Linear(h_dim, 1)
-        self.std_head = nn.Linear(h_dim, 1)
+        # self.mean_head = nn.Linear(h_dim, 1)
+        # self.std_head = nn.Linear(h_dim, 1)
+        self.mean_head = nn.Sequential(
+            nn.Linear(h_dim, h_dim),
+            nn.ReLU(),
+            nn.Linear(h_dim, 1),
+        )
+        self.std_head = nn.Sequential(
+            nn.Linear(h_dim, h_dim),
+            nn.ReLU(),
+            nn.Linear(h_dim, 1),
+        )
 
     def forward(self, s, z, g):
         """
