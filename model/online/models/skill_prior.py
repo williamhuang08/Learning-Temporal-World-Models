@@ -4,9 +4,9 @@ import torch.nn as nn
 
 class AbstractSkillPrior(nn.Module):
     """
-    Unimodal Gaussian skill prior conditioned on an abstract state.
+    Unimodal Gaussian skill prior: p_omega(z | s_0).
 
-    Input:  abstract state s_t
+    Input:  RSSM feature s_0  (s_dim = rssm_h_dim + rssm_stoch_dim)
     Output: (mean, std) over skill z
     """
 
