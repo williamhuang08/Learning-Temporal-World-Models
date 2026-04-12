@@ -3,7 +3,10 @@ import torch.nn as nn
 
 
 class SkillPolicy(nn.Module):
-    """Low-level skill-conditioned policy, pi_theta."""
+    """Low-level skill-conditioned policy: pi_theta(a_t | s_t, z).
+
+    state_dim should be the RSSM feature dimension (h_dim + stoch_dim).
+    """
 
     def __init__(self, state_dim, action_dim, h_dim=256, z_dim=256,
                  min_std=0.1, max_std=2.0, fixed_sig=None):
