@@ -1,9 +1,6 @@
-from .segment_latent_model import (
-    StartStateEncoder,
-    StatePosteriorTransformer,
-    SegmentDynamics,
-)
-from .observation_decoder import SegmentObservationDecoder
+from .rssm import RSSM
+from .segment_latent_model import TerminalStatePredictor
+from .observation_decoder import ObservationDecoder
+from .reward_decoder import RewardDecoder
 from .skill_encoder import TransformerSkillEncoder
-from .reward_model import RewardModel
 from .skill_prior import AbstractSkillPrior
