@@ -1,23 +1,29 @@
 from dataclasses import dataclass, field
 from datetime import date
 
+from numpy.random import f
+
 @dataclass
 class ModelConfig:
     # Environment dimensions
     obs_dim: int = 29
     action_dim: int = 8
-    goal_dim: int = 2        # raw goal (e.g. desired_goal xy) for goal-conditioned reward head
+    goal_dim: int = 2        # raw goal (e.g. desired_goal xy) for distance-based planning cost
 
-    # Latent dimensions
-    s_dim: int = 16        # abstract state dimension
-    z_dim: int = 256       # skill dimension
-    h_dim: int = 256       # hidden layer width (matching NUM_NEURONS in skill_model.py)
+    # Skill dimension
+    z_dim: int = 256
+    h_dim: int = 256       # hidden layer width for MLPs
 
     # Temporal abstraction
-    H: int = 40            # real timesteps per abstract timestep
+    H: int = 10            # real timesteps per abstract timestep (T = H)
 
-    # RSSM (deterministic hidden state dimension)
-    rssm_h_dim: int = 256
+    # RSSM
+    rssm_h_dim: int = 256       # deterministic GRU hidden state
+    rssm_stoch_dim: int = 32    # stochastic latent per timestep
+
+    @property
+    def rssm_feature_dim(self) -> int:
+        return self.rssm_h_dim + self.rssm_stoch_dim
 
     # Skill and state encoder (Transformer)
     d_model: int = 256
@@ -32,16 +38,12 @@ class ModelConfig:
 @dataclass
 class TrainConfig:
     # Loss weights
-    beta: float = 1.0          # skill KL weight
-    alpha_s: float = 0.1       # state KL weight
-    reward_weight: float = 1.0
-    recon_weight: float = 1.0  # NLL on o_0, o_H from SegmentObservationDecoder
+    recon_weight: float = 1.0   # observation + reward reconstruction in L_RSSM
+    free_nats: float = 1.0      # Dreamer-style KL floor; <=0 disables
 
-    # KL balancing (DreamerV2-style)
-    kl_balance: bool = True
+    # KL balancing (DreamerV2-style, applied to RSSM per-step KL)
+    kl_balance: bool = False
     kl_balance_alpha: float = 0.8
-    # Dreamer-style free nats: train loss uses max(free_nats, KL) per KL term. <=0 disables.
-    free_nats: float = 1.0
 
     # Optimiser
     lr: float = 2e-5
@@ -52,7 +54,7 @@ class TrainConfig:
     m_steps: int = 1
 
     # Training schedule
-    epochs: int = 1000
+    epochs: int = 10000
     batch_size: int = 100
     checkpoint_every: int = 50
 
@@ -70,13 +72,33 @@ class TrainConfig:
     save_path: str = ""
 
     def __post_init__(self):
+        ds_short = self.dataset_name.rsplit("/", 1)[-1] if "/" in self.dataset_name else self.dataset_name
         summary = (
             f"{date.today().strftime('%Y-%m-%d')}"
-            f"_klbal-{self.kl_balance}_alpha-{self.kl_balance_alpha}"
-            f"_beta-{self.beta}_as-{self.alpha_s}"
-            f"_rw-{self.reward_weight}_lr-{self.lr}"
+            f"_{ds_short}"
+            f"_lr{self.lr}"
+            f"_H{self.H}"
+            f"rssm_dim{self.rssm_stoch_dim}"
+            f"_fn{self.free_nats}"
+            f"_e{self.e_steps}m{self.m_steps}"
         )
         if not self.wandb_run_name:
             self.wandb_run_name = summary
         if not self.save_path:
-            self.save_path = f"checkpoints/dreamer_rssm/{summary}"
+            self.save_path = f"checkpoints/rssm_causal/{summary}"
+
+    def make_summary(self, model_cfg: "ModelConfig") -> str:
+        """Full summary string incorporating both train and model config."""
+        ds_short = self.dataset_name.rsplit("/", 1)[-1] if "/" in self.dataset_name else self.dataset_name
+        return (
+            f"{date.today().strftime('%Y-%m-%d')}"
+            f"_{ds_short}"
+            f"_H{model_cfg.H}"
+            f"_z{model_cfg.z_dim}"
+            f"_rssm-h{model_cfg.rssm_h_dim}-s{model_cfg.rssm_stoch_dim}"
+            f"_lr{self.lr}"
+            f"_bs{self.batch_size}"
+            f"_fn{self.free_nats}"
+            f"_rw{self.recon_weight}"
+            f"_e{self.e_steps}m{self.m_steps}"
+        )
